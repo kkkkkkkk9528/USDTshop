@@ -13,7 +13,9 @@ export async function HeroSection({ basePath, locale }: HeroSectionProps) {
     locale: locale as Locale,
     namespace: "home",
   });
-  const { name: storeName } = await getStore(locale);
+  const { name: storeName, meta_description: storeDescription } =
+    await getStore(locale);
+  const heroDescription = storeDescription || t("heroDescription");
 
   return (
     <section className="border-b border-gray-200 min-h-[823px] md:min-h-0 flex items-center">
@@ -23,7 +25,7 @@ export async function HeroSection({ basePath, locale }: HeroSectionProps) {
             {t("welcome", { storeName })}
           </h1>
           <p className="mt-4 text-lg text-gray-600 max-w-2xl mx-auto">
-            {t("heroDescription")}
+            {heroDescription}
           </p>
           <div className="mt-8 flex justify-center gap-4 flex-wrap">
             <Button size="lg" asChild>

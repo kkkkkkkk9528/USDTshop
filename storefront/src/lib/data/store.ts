@@ -1,14 +1,12 @@
 import type { Store } from "@spree/sdk";
-import { cacheLife, cacheTag } from "next/cache";
 import { cache } from "react";
 import { DEFAULT_LOCALE, resolveSupportedLocale } from "@/i18n/locales";
 import { getClient } from "@/lib/spree";
 import { FALLBACK_STORE_NAME, getDefaultLocale } from "@/lib/store";
 
 async function cachedGetStore(locale: string): Promise<Store> {
-  "use cache: remote";
-  cacheLife("hours");
-  cacheTag("store");
+  // Fetch per-locale at request time. The previous remote data cache ignored
+  // the locale argument and served one language to every locale.
   return getClient().store.get({ locale });
 }
 

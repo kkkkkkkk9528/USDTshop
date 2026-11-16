@@ -35,7 +35,7 @@ export function FooterCategoryLinks({
 }
 
 export async function Footer({ basePath, locale, categoryLinks }: FooterProps) {
-  const [t, tp, { name: storeName }] = await Promise.all([
+  const [t, tp, { name: storeName, meta_description: storeDescription }] = await Promise.all([
     getTranslations({ locale, namespace: "footer" }),
     getTranslations({ locale, namespace: "policies" }),
     getStore(locale),
@@ -50,7 +50,9 @@ export async function Footer({ basePath, locale, categoryLinks }: FooterProps) {
           {/* Brand */}
           <div className="col-span-1 md:col-span-2">
             <span className="text-xl font-bold text-white">{storeName}</span>
-            <p className="mt-4 text-sm text-neutral-400">{t("description")}</p>
+            <p className="mt-4 text-sm text-neutral-400">
+              {storeDescription || t("description")}
+            </p>
           </div>
 
           {/* Links */}
