@@ -1,0 +1,400 @@
+import fs from 'node:fs'
+import { createRequire } from 'node:module'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+import tailwindcss from '@tailwindcss/vite'
+import type { Plugin, PluginOption } from 'vite'
+// Explicit .js extension: this entry ships compiled (dist/vite), where the
+// specifier must name the real emitted file — tsup transpiles 1:1 without
+// rewriting import paths. Bundlers map .js back to the .ts source.
+import { discoverDashboardPlugins } from './discover.js'
+
+export interface SpreeDashboardPluginOptions {
+  /**
+   * Path to the host app's CSS entry file (the one that does
+   * `@import "@spree/dashboard-ui/styles.css"`). Resolved relative to the
+   * host's project root. The plugin injects `@source` directives into this
+   * file so Tailwind v4 scans every Spree dashboard package and every
+   * dashboard plugin for class usage.
+   *
+   * Defaults to `./src/styles.css`, which fits the conventional Vite layout.
+   */
+  cssEntry?: string
+
+  /**
+   * Shell packages whose source Tailwind should scan, on top of
+   * `@spree/dashboard-core` and `@spree/dashboard-ui`. Defaults to
+   * `['@spree/dashboard']`, the operator's dashboard. A different panel — a
+   * seller's, or a host's own shell — passes its own package name here so its
+   * components' classes survive the build. Unresolvable names are skipped
+   * rather than erroring: a custom dashboard composed straight from core + ui
+   * has no shell at all.
+   */
+  shellPackages?: string[]
+
+  /**
+   * Names of dashboard plugin packages installed in the host app. Each name
+   * must be a resolvable npm package specifier — the same string you'd pass
+   * to `import()`. The plugin resolves each one via Node module resolution
+   * and tells Tailwind v4 to scan its source files for class usage.
+   *
+   * When omitted (the typical case), the plugin auto-discovers installed
+   * dashboard plugins by walking the host's `package.json` dependencies and
+   * picking up anything that declares
+   * `"spree": { "dashboard": { "plugin": true } }`. Pass an explicit array
+   * to opt out of auto-discovery — useful for whitelisting in tightly
+   * controlled environments.
+   *
+   * Example: `['@my-store/orders-plugin', '@my-store/wishlists-plugin']`.
+   */
+  plugins?: string[]
+}
+
+/**
+ * Vite plugin that wires up a Spree dashboard's plugin system and Tailwind v4.
+ *
+ * Combines three concerns:
+ *
+ *   1. Plugin activation: serves `virtual:spree-dashboard-plugins`, a
+ *      synthesized module that side-effect-imports every dashboard plugin
+ *      (auto-discovered or whitelisted). The app entry imports it once —
+ *      after that, installing a plugin is just `pnpm add`; its
+ *      `defineDashboardPlugin` call runs without any host-code edit.
+ *
+ *   2. Source-scanning: tells Tailwind to scan `@spree/dashboard-core`,
+ *      `@spree/dashboard-ui`, and every plugin package, by injecting
+ *      `@source` directives into the host's CSS entry. Tailwind v4
+ *      doesn't scan `node_modules` by default and only accepts filesystem
+ *      paths in `@source` directives (not bare package specifiers), so we
+ *      resolve each package through Node module resolution to get an
+ *      absolute path that works under any package layout (workspace
+ *      symlinks, npm tarballs, pnpm's `.pnpm/` hoisting).
+ *
+ *   3. Tailwind itself: returns `@tailwindcss/vite` bundled alongside the
+ *      source-injection plugin, in the right order. Hosts don't add
+ *      `@tailwindcss/vite` separately.
+ *
+ * Usage from a host using the full `@spree/dashboard` app shell:
+ *
+ *     // host vite.config.ts
+ *     import { spreeDashboardPlugin } from '@spree/dashboard-core/vite'
+ *
+ *     export default defineConfig({
+ *       plugins: [
+ *         spreeDashboardPlugin(),
+ *         // … react(), TanStack Router, etc. — host owns these.
+ *       ],
+ *     })
+ *
+ *     // host src/main.tsx (once, before the router mounts)
+ *     import 'virtual:spree-dashboard-plugins'
+ *
+ * For a custom dashboard built on `@spree/dashboard-core` + `@spree/dashboard-ui`,
+ * point `cssEntry` at the host's own CSS file:
+ *
+ *     spreeDashboardPlugin({
+ *       cssEntry: './src/admin.css',
+ *       plugins: ['@my-store/seller-portal-plugin'],  // explicit whitelist opt-out
+ *     })
+ */
+export function spreeDashboardPlugin(options: SpreeDashboardPluginOptions = {}): PluginOption[] {
+  return [
+    dashboardProseMirrorDedupePlugin(),
+    dashboardTailwindSourcePlugin(options),
+    tailwindcss(),
+    dashboardFontPreloadPlugin(),
+    dashboardPackagesPlugin(),
+  ]
+}
+
+/**
+ * Bakes the host's installed `@spree/*` package versions into the build as
+ * `__SPREE_PACKAGES__`, so the diagnostics report can name the dashboard a
+ * merchant actually deployed, which the server has no way to know.
+ */
+function dashboardPackagesPlugin(): Plugin {
+  return {
+    name: 'spree:dashboard-packages',
+    config(config) {
+      const root = path.resolve(config.root ?? process.cwd())
+      return { define: { __SPREE_PACKAGES__: JSON.stringify(installedSpreePackages(root)) } }
+    },
+  }
+}
+
+/**
+ * `@spree/*` packages the host installs, directly or through another Spree
+ * package (`@spree/core` comes in with the dashboard), by installed version.
+ * Exported for tests.
+ */
+export function installedSpreePackages(root: string): Record<string, string> {
+  const versions: Record<string, string> = {}
+  const visit = (packageRoot: string, includeDev: boolean) => {
+    const manifest = readJson(path.join(packageRoot, 'package.json'))
+    const dependencies = {
+      ...manifest?.dependencies,
+      ...manifest?.peerDependencies,
+      ...(includeDev ? manifest?.devDependencies : {}),
+    }
+    const require = createRequire(path.join(packageRoot, 'package.json'))
+    for (const name of Object.keys(dependencies)) {
+      if (!name.startsWith('@spree/') || name in versions) continue
+      const dependencyRoot = resolvePackageRoot(name, require)
+      const dependency = dependencyRoot && readJson(path.join(dependencyRoot, 'package.json'))
+      if (!dependencyRoot || !dependency || dependency.private) continue
+      versions[name] = dependency.version
+      visit(dependencyRoot, false)
+    }
+  }
+  visit(root, true)
+  return Object.fromEntries(Object.entries(versions).sort(([a], [b]) => a.localeCompare(b)))
+}
+
+function readJson(file: string): Record<string, any> | null {
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf-8'))
+  } catch {
+    return null
+  }
+}
+
+/** The Latin subset of the dashboard's sans font, which nearly every page renders. */
+const PRELOADED_FONT_FILE = 'inter-latin-opsz-normal.woff2'
+
+/**
+ * Preloads the Latin sans font in production builds. The font is otherwise
+ * discovered only after the CSS is downloaded and parsed, so the first paint
+ * falls back to the system font. Hosts that replace the font emit no such
+ * file and get no tag.
+ */
+function dashboardFontPreloadPlugin(): Plugin {
+  let base = '/'
+  return {
+    name: 'spree:dashboard-font-preload',
+    apply: 'build',
+    configResolved(config) {
+      base = config.base
+    },
+    transformIndexHtml(_html, ctx) {
+      const font = Object.values(ctx.bundle ?? {}).find(
+        (file) => file.type === 'asset' && file.names.includes(PRELOADED_FONT_FILE),
+      )
+      if (!font) return
+      return [
+        {
+          tag: 'link',
+          attrs: {
+            rel: 'preload',
+            href: `${base}${font.fileName}`,
+            as: 'font',
+            type: 'font/woff2',
+            crossorigin: '',
+          },
+          injectTo: 'head',
+        },
+      ]
+    },
+  }
+}
+
+/**
+ * TipTap 3.31's `@tiptap/pm` asks for `prosemirror-model` ^1.25.11, but
+ * `prosemirror-schema-list` still resolves 1.25.4. Two copies in the
+ * bundle make `wrapInList` throw. Force Vite onto one module.
+ */
+function dashboardProseMirrorDedupePlugin(): Plugin {
+  return {
+    name: 'spree:dashboard-prosemirror-dedupe',
+    config() {
+      return {
+        resolve: {
+          dedupe: ['prosemirror-model', 'prosemirror-view', '@tiptap/pm', '@tiptap/core'],
+        },
+      }
+    },
+  }
+}
+
+/** Module specifier hosts import to activate discovered dashboard plugins. */
+export const VIRTUAL_PLUGIN_MODULE_ID = 'virtual:spree-dashboard-plugins'
+// Rollup convention: \0 marks the resolved id as virtual so other plugins
+// (and Vite's own resolver) leave it alone.
+const RESOLVED_VIRTUAL_PLUGIN_MODULE_ID = `\0${VIRTUAL_PLUGIN_MODULE_ID}`
+
+/**
+ * Source of `virtual:spree-dashboard-plugins`: one side-effect import per
+ * activatable plugin, in discovery order. Exported for tests.
+ */
+export function generateVirtualPluginModule(packages: readonly string[]): string {
+  const header = '// generated by @spree/dashboard-core/vite — one import per dashboard plugin'
+  if (packages.length === 0) return `${header}\nexport {}\n`
+  const imports = packages.map((pkg) => `import ${JSON.stringify(pkg)}`).join('\n')
+  return `${header}\n${imports}\nexport {}\n`
+}
+
+function dashboardTailwindSourcePlugin(options: SpreeDashboardPluginOptions): Plugin {
+  const explicitPlugins = options.plugins
+  const cssEntry = options.cssEntry ?? './src/styles.css'
+
+  // Resolution root for the framework's own siblings. Wherever
+  // `@spree/dashboard-core` ends up on disk (workspace symlink, hoisted
+  // npm install, pnpm `.pnpm/` directory), `@spree/dashboard-ui` is
+  // reachable from here via Node module resolution.
+  const fromHere = createRequire(import.meta.url)
+
+  let resolvedSources: string[] = []
+  let resolvedCssEntry = ''
+  let pluginErrors: PluginError[] = []
+  let activatablePlugins: string[] = []
+
+  return {
+    name: 'spree:dashboard-tailwind-source',
+    enforce: 'pre',
+
+    configResolved(config) {
+      resolvedCssEntry = path.resolve(config.root, cssEntry).split(path.sep).join('/')
+
+      // `plugins: []` is an explicit empty whitelist; only `plugins` omitted
+      // triggers discovery. Discovery walks the host's package.json deps and
+      // returns names that opt-in via the `spree.dashboard.plugin` marker.
+      const pluginPackages =
+        explicitPlugins ??
+        discoverDashboardPlugins({
+          root: config.root,
+          onWarn: (msg) => console.warn(`[@spree/dashboard-core/vite] ${msg}`),
+        })
+
+      // Plugins are the host's dependencies, so resolve them from the host
+      // root — under pnpm's strict layout they are not necessarily reachable
+      // from dashboard-core's own location.
+      const fromHost = createRequire(path.join(config.root, 'package.json'))
+
+      pluginErrors = []
+      resolvedSources = []
+      activatablePlugins = []
+      for (const pkg of ['@spree/dashboard-core', '@spree/dashboard-ui']) {
+        const dir = resolvePackageSourceDir(pkg, fromHere)
+        if (dir) {
+          resolvedSources.push(dir)
+        } else {
+          pluginErrors.push({ pkg, kind: 'unresolved' })
+        }
+      }
+      // The app shell is optional: present when the host builds on a full
+      // shell package, absent for custom dashboards composed directly from
+      // core + ui — hence no error when unresolved. Which shell varies by
+      // panel: `@spree/dashboard` for the operator's, `@spree/seller-dashboard`
+      // for a seller's, or a host's own.
+      for (const shell of options.shellPackages ?? ['@spree/dashboard']) {
+        const shellDir = resolvePackageSourceDir(shell, fromHost)
+        if (shellDir) resolvedSources.push(shellDir)
+      }
+      for (const pkg of pluginPackages) {
+        const dir = resolvePackageSourceDir(pkg, fromHost)
+        if (dir) {
+          resolvedSources.push(dir)
+          activatablePlugins.push(pkg)
+        } else {
+          // Unresolved plugins are reported via the dev overlay instead of
+          // being imported — a bare failing import would crash the dev
+          // server with a much less actionable error.
+          pluginErrors.push({ pkg, kind: 'unresolved' })
+        }
+      }
+    },
+
+    resolveId(id) {
+      if (id === VIRTUAL_PLUGIN_MODULE_ID) return RESOLVED_VIRTUAL_PLUGIN_MODULE_ID
+      return null
+    },
+
+    load(id) {
+      if (id !== RESOLVED_VIRTUAL_PLUGIN_MODULE_ID) return null
+      return generateVirtualPluginModule(activatablePlugins)
+    },
+
+    transform(code, id) {
+      const normalized = id.split('?')[0].replaceAll('\\', '/')
+      if (normalized !== resolvedCssEntry) return null
+
+      const directives = resolvedSources.map((dir) => `@source '${dir}';`).join('\n')
+
+      return {
+        code: `${code}\n\n/* injected by @spree/dashboard-core/vite */\n${directives}\n`,
+        map: null,
+      }
+    },
+
+    configureServer(server) {
+      // Surface unresolved plugins as a Vite error overlay in dev so the
+      // failure mode is loud. Without this, a missing plugin silently emits
+      // unstyled HTML when the host imports it. Sent once per client
+      // connection rather than per HTTP request.
+      if (pluginErrors.length === 0) return
+      const message = formatPluginErrorOverlay(pluginErrors)
+      server.ws.on('connection', () => {
+        server.ws.send({
+          type: 'error',
+          err: {
+            message,
+            stack: '',
+            plugin: 'spree:dashboard-tailwind-source',
+          },
+        })
+      })
+    },
+  }
+}
+
+interface PluginError {
+  pkg: string
+  kind: 'unresolved'
+}
+
+function formatPluginErrorOverlay(errors: PluginError[]): string {
+  const lines = [
+    'Spree dashboard plugin(s) could not be resolved:',
+    '',
+    ...errors.map(({ pkg }) => `  - ${pkg}`),
+    '',
+    'For each one, check:',
+    '  1. The package is installed (`pnpm add <package>`)',
+    '  2. Its package.json declares the dashboard marker:',
+    '       { "spree": { "dashboard": { "plugin": true } } }',
+    '',
+    'If you registered it explicitly via spreeDashboardPlugin({ plugins: [...] }),',
+    'verify the name matches the installed package exactly.',
+  ]
+  return lines.join('\n')
+}
+
+/**
+ * Resolve `<package>/src` on disk. Resolves the package's main entry point
+ * (defined by its `exports` map or `main` field) and walks upwards looking
+ * for `package.json` to find the package root. Avoids requiring
+ * `<pkg>/package.json` to be in the package's `exports` map — many packages,
+ * including ours, don't list it there.
+ */
+function resolvePackageSourceDir(pkg: string, require: NodeJS.Require): string | null {
+  const packageRoot = resolvePackageRoot(pkg, require)
+  return packageRoot && path.join(packageRoot, 'src')
+}
+
+function resolvePackageRoot(pkg: string, require: NodeJS.Require): string | null {
+  try {
+    const entryPath = require.resolve(pkg)
+    return findPackageRoot(entryPath.startsWith('file:') ? fileURLToPath(entryPath) : entryPath)
+  } catch {
+    return null
+  }
+}
+
+function findPackageRoot(fromFile: string): string | null {
+  let current = path.dirname(fromFile)
+  const { root } = path.parse(current)
+  while (current !== root) {
+    if (fs.existsSync(path.join(current, 'package.json'))) return current
+    current = path.dirname(current)
+  }
+  return null
+}

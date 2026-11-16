@@ -1,0 +1,461 @@
+import type { Claim, Exchange, Order } from '@spree/admin-sdk'
+import { CLAIM_STATUSES, EXCHANGE_STATUSES, subsetOf } from '@spree/core'
+import {
+  formatMoney,
+  isPositiveMoney,
+  Money,
+  postSaleItemRow,
+  useMetadataSheet,
+  useMoneyLocale,
+  usePermissions,
+  ViewMetadataMenuItem,
+} from '@spree/dashboard-core'
+import {
+  Badge,
+  Button,
+  Card,
+  CardAction,
+  CardFooter,
+  CardHeader,
+  CardTitle,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+  FulfillmentItemList,
+  hasMetadata,
+  Section,
+  SectionActions,
+  SectionHeader,
+  SectionTitle,
+  StatusBadge,
+  useConfirm,
+} from '@spree/dashboard-ui'
+import {
+  BanIcon,
+  BanknoteIcon,
+  CheckCircleIcon,
+  EllipsisVerticalIcon,
+  PackageCheckIcon,
+  PlusIcon,
+  RepeatIcon,
+  ShieldAlertIcon,
+  TruckIcon,
+  XCircleIcon,
+} from '@spree/dashboard-ui/icons'
+import { useState } from 'react'
+import { useTranslation } from 'react-i18next'
+import {
+  useClaimActions,
+  useExchangeActions,
+  useOrderClaims,
+  useOrderExchanges,
+} from '../../hooks/use-post-sale'
+import { variantLabel } from '../../lib/variant-label'
+import {
+  CreateClaimDialog,
+  CreateExchangeDialog,
+  fulfilledUnits,
+  ResolveClaimDialog,
+} from './post-sale-create-dialogs'
+import { useProductLink } from './variant-link'
+
+// Statuses that still offer an action. A terminal record would otherwise
+// show a menu button that opens onto nothing.
+const EXCHANGE_ACTIONABLE = subsetOf(EXCHANGE_STATUSES, ['requested', 'approved', 'received'])
+const CLAIM_ACTIONABLE = subsetOf(CLAIM_STATUSES, ['open', 'approved'])
+const EXCHANGE_CANCELABLE = subsetOf(EXCHANGE_STATUSES, ['requested', 'approved'])
+
+/** Exchanges on an order, with the actions available at each status. */
+export function OrderExchangesCard({ order }: { order: Order }) {
+  const productLink = useProductLink()
+  const locale = useMoneyLocale()
+  const orderId = order.id
+  const { t } = useTranslation()
+  const confirm = useConfirm()
+  const { data } = useOrderExchanges(orderId)
+  const { create, approve, receive, fulfill, cancel } = useExchangeActions(orderId)
+  // Fulfilling settles money on what came back, so the API wants the refunds
+  // permission for it; without it the action is not offered.
+  const { permissionKeys } = usePermissions()
+  const canRefund = permissionKeys.includes('write_refunds')
+  const [creating, setCreating] = useState(false)
+  const metadataSheet = useMetadataSheet()
+
+  const exchanges = data?.data ?? []
+  const canCreate = fulfilledUnits(order).length > 0
+
+  return (
+    <>
+      <Section>
+        <SectionHeader>
+          <SectionTitle>
+            <RepeatIcon className="size-4" />
+            {t('admin.pages.orders.detail.section_exchanges')}
+            {exchanges.length > 0 && <Badge variant="outline">{exchanges.length}</Badge>}
+          </SectionTitle>
+          <SectionActions>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={!canCreate}
+              title={canCreate ? undefined : t('admin.pages.orders.detail.returns.empty_no_units')}
+              onClick={() => setCreating(true)}
+            >
+              <PlusIcon className="size-4" />
+              {t('admin.pages.orders.detail.exchanges.actions.create')}
+            </Button>
+          </SectionActions>
+        </SectionHeader>
+        <div className="flex flex-col gap-4">
+          {exchanges.length === 0 && (
+            <p className="text-base text-muted-foreground">
+              {canCreate
+                ? t('admin.pages.orders.detail.exchanges.empty')
+                : t('admin.pages.orders.detail.returns.empty_no_units')}
+            </p>
+          )}
+          {exchanges.map((exchange: Exchange) => (
+            <Card key={exchange.id}>
+              <CardHeader>
+                <CardTitle className="text-base font-medium">
+                  <StatusBadge status={exchange.status} />
+                  <span className="text-base font-medium">{exchange.number}</span>
+                </CardTitle>
+
+                {(EXCHANGE_ACTIONABLE.includes(exchange.status) ||
+                  hasMetadata(exchange.metadata)) && (
+                  <CardAction>
+                    <DropdownMenu>
+                      <DropdownMenuTrigger asChild>
+                        <Button variant="ghost" size="icon-xs">
+                          <EllipsisVerticalIcon className="size-4" />
+                          <span className="sr-only">{t('admin.actions.actions_menu')}</span>
+                        </Button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end">
+                        {exchange.status === 'requested' && (
+                          <DropdownMenuItem onClick={() => approve.mutate(exchange.id)}>
+                            <CheckCircleIcon className="size-4" />
+                            {t('admin.pages.orders.detail.returns.actions.approve')}
+                          </DropdownMenuItem>
+                        )}
+                        {exchange.status === 'approved' && (
+                          <DropdownMenuItem
+                            onClick={() => receive.mutate({ exchangeId: exchange.id })}
+                          >
+                            <PackageCheckIcon className="size-4" />
+                            {t('admin.pages.orders.detail.returns.actions.receive')}
+                          </DropdownMenuItem>
+                        )}
+                        {exchange.status === 'received' && canRefund && (
+                          <DropdownMenuItem
+                            onClick={async () => {
+                              // A dearer replacement leaves the customer owing
+                              // the difference, which fulfilling puts on the order.
+                              if (
+                                isPositiveMoney(exchange.price_difference) &&
+                                !(await confirm({
+                                  message: t(
+                                    'admin.pages.orders.detail.exchanges.confirm.balance_due',
+                                  ),
+                                  confirmLabel: t(
+                                    'admin.pages.orders.detail.exchanges.actions.fulfill',
+                                  ),
+                                }))
+                              ) {
+                                return
+                              }
+                              fulfill.mutate({ exchangeId: exchange.id })
+                            }}
+                          >
+                            <TruckIcon className="size-4" />
+                            {t('admin.pages.orders.detail.exchanges.actions.fulfill')}
+                          </DropdownMenuItem>
+                        )}
+                        <ViewMetadataMenuItem
+                          metadata={exchange.metadata}
+                          onClick={() => metadataSheet.show(exchange.metadata, exchange.number)}
+                        />
+                        {EXCHANGE_CANCELABLE.includes(exchange.status) && (
+                          <>
+                            <DropdownMenuSeparator />
+                            <DropdownMenuItem
+                              variant="destructive"
+                              onClick={async () => {
+                                if (
+                                  await confirm({
+                                    message: t('admin.pages.orders.detail.returns.confirm.cancel'),
+                                    variant: 'destructive',
+                                    confirmLabel: t(
+                                      'admin.pages.orders.detail.exchanges.confirm.cancel_confirm',
+                                    ),
+                                    cancelLabel: t(
+                                      'admin.pages.orders.detail.exchanges.confirm.cancel_dismiss',
+                                    ),
+                                  })
+                                ) {
+                                  cancel.mutate({ exchangeId: exchange.id })
+                                }
+                              }}
+                            >
+                              <XCircleIcon className="size-4" />
+                              {t('admin.actions.cancel')}
+                            </DropdownMenuItem>
+                          </>
+                        )}
+                      </DropdownMenuContent>
+                    </DropdownMenu>
+                  </CardAction>
+                )}
+              </CardHeader>
+
+              <FulfillmentItemList
+                productLink={productLink}
+                rows={(exchange.exchange_line_items ?? []).map((line) => {
+                  const row = postSaleItemRow(
+                    line.id,
+                    {
+                      line_item_id: line.line_item_id,
+                      variant_id: line.original_variant_id,
+                      variant: line.original_variant,
+                      quantity: line.quantity,
+                    },
+                    order.items ?? [],
+                  )
+                  return {
+                    ...row,
+                    replacement: {
+                      name: variantLabel(
+                        line.new_variant && { product_name: line.new_variant.product_name },
+                        line.new_variant_id,
+                      ),
+                      optionsText: line.new_variant?.options_text,
+                      thumbnailUrl: line.new_variant?.thumbnail_url,
+                      productId: line.new_variant?.product_id,
+                      displayPrice: formatMoney(line.new_variant_price, order.currency, locale, {
+                        unitPrice: true,
+                      }),
+                      label: t('admin.pages.orders.detail.exchanges.replacement_variant'),
+                    },
+                  }
+                })}
+              />
+
+              <CardFooter className="justify-between text-base">
+                <span className="text-muted-foreground">
+                  {t('admin.pages.orders.detail.exchanges.price_difference')}
+                </span>
+                <span className="font-medium">
+                  <Money amount={exchange.price_difference} currency={order.currency} />
+                </span>
+              </CardFooter>
+            </Card>
+          ))}
+        </div>
+      </Section>
+
+      {creating && (
+        <CreateExchangeDialog
+          order={order}
+          onClose={() => setCreating(false)}
+          onSubmit={(params) => {
+            create.mutate(params)
+            setCreating(false)
+          }}
+        />
+      )}
+
+      {metadataSheet.sheet}
+    </>
+  )
+}
+
+/** Claims on an order. Resolution is chosen at resolve time, not up front. */
+export function OrderClaimsCard({ order }: { order: Order }) {
+  const productLink = useProductLink()
+  const orderId = order.id
+  const { t } = useTranslation()
+  const confirm = useConfirm()
+  const { data } = useOrderClaims(orderId)
+  const { create, approve, resolve, deny, cancel } = useClaimActions(orderId)
+  // A resolution may pay the customer back, which takes the refunds
+  // permission; resolving is left to staff who hold it.
+  const { permissionKeys } = usePermissions()
+  const canRefund = permissionKeys.includes('write_refunds')
+  const [creatingClaim, setCreatingClaim] = useState(false)
+  const [resolving, setResolving] = useState<Claim | null>(null)
+  const metadataSheet = useMetadataSheet()
+
+  const claims = data?.data ?? []
+  // A claim is about ordered items, so it never depends on anything shipping.
+  const canCreate = (order.items ?? []).length > 0
+
+  return (
+    <>
+      <Section>
+        <SectionHeader>
+          <SectionTitle>
+            <ShieldAlertIcon className="size-4" />
+            {t('admin.pages.orders.detail.section_claims')}
+            {claims.length > 0 && <Badge variant="outline">{claims.length}</Badge>}
+          </SectionTitle>
+          <SectionActions>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={!canCreate}
+              onClick={() => setCreatingClaim(true)}
+            >
+              <PlusIcon className="size-4" />
+              {t('admin.pages.orders.detail.claims.actions.create')}
+            </Button>
+          </SectionActions>
+        </SectionHeader>
+        <div className="flex flex-col gap-4">
+          {claims.length === 0 && (
+            <p className="text-base text-muted-foreground">
+              {t('admin.pages.orders.detail.claims.empty')}
+            </p>
+          )}
+          {claims.map((claim: Claim) => (
+            <Card key={claim.id}>
+              <CardHeader>
+                <CardTitle className="text-base font-medium">
+                  <StatusBadge status={claim.status} />
+                  <span className="text-base font-medium">{claim.number}</span>
+                </CardTitle>
+
+                {(CLAIM_ACTIONABLE.includes(claim.status) || hasMetadata(claim.metadata)) && (
+                  <CardAction>
+                    <DropdownMenu>
+                      <DropdownMenuTrigger asChild>
+                        <Button variant="ghost" size="icon-xs">
+                          <EllipsisVerticalIcon className="size-4" />
+                          <span className="sr-only">{t('admin.actions.actions_menu')}</span>
+                        </Button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end">
+                        {claim.status === 'open' && (
+                          <DropdownMenuItem onClick={() => approve.mutate(claim.id)}>
+                            <CheckCircleIcon className="size-4" />
+                            {t('admin.pages.orders.detail.returns.actions.approve')}
+                          </DropdownMenuItem>
+                        )}
+                        {claim.status === 'approved' && canRefund && (
+                          <DropdownMenuItem onClick={() => setResolving(claim)}>
+                            <BanknoteIcon className="size-4" />
+                            {t('admin.pages.orders.detail.claims.actions.resolve')}
+                          </DropdownMenuItem>
+                        )}
+                        <ViewMetadataMenuItem
+                          metadata={claim.metadata}
+                          onClick={() => metadataSheet.show(claim.metadata, claim.number)}
+                        />
+                        {CLAIM_ACTIONABLE.includes(claim.status) && <DropdownMenuSeparator />}
+                        {claim.status === 'open' && (
+                          <DropdownMenuItem
+                            variant="destructive"
+                            onClick={async () => {
+                              if (
+                                await confirm({
+                                  message: t('admin.pages.orders.detail.claims.confirm.deny'),
+                                  variant: 'destructive',
+                                  confirmLabel: t('admin.pages.orders.detail.claims.actions.deny'),
+                                })
+                              ) {
+                                deny.mutate({ claimId: claim.id })
+                              }
+                            }}
+                          >
+                            <BanIcon className="size-4" />
+                            {t('admin.pages.orders.detail.claims.actions.deny')}
+                          </DropdownMenuItem>
+                        )}
+                        {CLAIM_ACTIONABLE.includes(claim.status) && (
+                          <DropdownMenuItem
+                            variant="destructive"
+                            onClick={async () => {
+                              if (
+                                await confirm({
+                                  message: t('admin.pages.orders.detail.returns.confirm.cancel'),
+                                  variant: 'destructive',
+                                  confirmLabel: t(
+                                    'admin.pages.orders.detail.claims.confirm.cancel_confirm',
+                                  ),
+                                  cancelLabel: t(
+                                    'admin.pages.orders.detail.claims.confirm.cancel_dismiss',
+                                  ),
+                                })
+                              ) {
+                                cancel.mutate({ claimId: claim.id })
+                              }
+                            }}
+                          >
+                            <XCircleIcon className="size-4" />
+                            {t('admin.actions.cancel')}
+                          </DropdownMenuItem>
+                        )}
+                      </DropdownMenuContent>
+                    </DropdownMenu>
+                  </CardAction>
+                )}
+              </CardHeader>
+
+              <FulfillmentItemList
+                productLink={productLink}
+                rows={(claim.claim_line_items ?? []).map((line) => {
+                  const row = postSaleItemRow(line.id, line, order.items ?? [])
+                  return {
+                    ...row,
+                    optionsText: [row.optionsText, line.description].filter(Boolean).join(' — '),
+                  }
+                })}
+              />
+
+              <CardFooter className="justify-between text-base">
+                <span className="text-muted-foreground">
+                  {t('admin.pages.orders.detail.returns.refund_total')}
+                </span>
+                <span className="font-medium">
+                  <Money amount={claim.refund_total} currency={order.currency} />
+                </span>
+              </CardFooter>
+            </Card>
+          ))}
+        </div>
+      </Section>
+
+      {resolving && (
+        <ResolveClaimDialog
+          claim={resolving}
+          onClose={() => setResolving(null)}
+          onSubmit={({ resolution, refundMethod, amount, replacementLineItemIds }) => {
+            resolve.mutate({
+              claimId: resolving.id,
+              resolution,
+              refundMethod,
+              amount,
+              replacementLineItemIds,
+            })
+            setResolving(null)
+          }}
+        />
+      )}
+
+      {creatingClaim && (
+        <CreateClaimDialog
+          order={order}
+          onClose={() => setCreatingClaim(false)}
+          onSubmit={(params) => {
+            create.mutate(params)
+            setCreatingClaim(false)
+          }}
+        />
+      )}
+
+      {metadataSheet.sheet}
+    </>
+  )
+}

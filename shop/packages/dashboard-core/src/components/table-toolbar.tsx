@@ -1,0 +1,1886 @@
+import { type FilterPredicate, randomUUID } from '@spree/core'
+import {
+  Button,
+  Checkbox,
+  cn,
+  DateRangePanel,
+  DropdownMenu,
+  DropdownMenuCheckboxItem,
+  DropdownMenuContent,
+  DropdownMenuLabel,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+  Input,
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+  SearchInput,
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+  StatusDot,
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from '@spree/dashboard-ui'
+import {
+  ArrowUpDownIcon,
+  CheckIcon,
+  ChevronLeftIcon,
+  ChevronRightIcon,
+  ChevronsUpDownIcon,
+  Columns3Icon,
+  ListFilter,
+  XIcon,
+} from '@spree/dashboard-ui/icons'
+import { useQuery } from '@tanstack/react-query'
+import { format, parse } from 'date-fns'
+import { Fragment, type ReactNode, useCallback, useDeferredValue, useMemo, useState } from 'react'
+import { useTranslation } from 'react-i18next'
+import { getApiClient } from '../api-client'
+import { useAuth } from '../hooks/use-auth'
+import { type TableDensity, useTableDensity } from '../hooks/use-table-density'
+import { DATE_PRESET_KEYS, matchDatePreset, resolveDatePreset } from '../lib/date-presets'
+import {
+  type ColumnDef,
+  type FilterRule,
+  parseFilterIds,
+  type SortOption,
+  type TaggableType,
+} from '../lib/table-registry'
+import { useOptionalStore } from '../providers/store-provider'
+import { useTenantId } from '../providers/tenant-provider'
+import { LocaleLabel, useLocaleLabel } from './locale-select'
+
+interface TableToolbarProps {
+  /** Displayable columns (for column selector and table headers) */
+  columns: ColumnDef[]
+  visibleColumns: string[]
+  onVisibleColumnsChange: (columns: string[]) => void
+  search: string
+  onSearchChange: (value: string) => void
+  searchable?: boolean
+  searchPlaceholder?: string
+  sort: SortOption
+  onSortChange: (sort: SortOption) => void
+  filters: FilterRule[]
+  onFiltersChange: (filters: FilterRule[]) => void
+  /** All columns including filter-only ones (for the filter drawer). Falls back to `columns` if not provided. */
+  allColumns?: ColumnDef[]
+  /** Hide the sort dropdown — used when the table is drag-reorderable, where free sorting would defeat the drag. */
+  hideSort?: boolean
+}
+
+// ============================================================================
+// Operators
+// ============================================================================
+
+// Operator labels are stored as i18n keys (`admin.components.table_toolbar.operators.*`)
+// and resolved with `t()` at render time so they follow the active language.
+type OperatorOption = { value: FilterPredicate; labelKey: string }
+
+const storeCodeOperators: OperatorOption[] = [
+  { value: 'eq', labelKey: 'admin.components.table_toolbar.operators.is' },
+  { value: 'not_eq', labelKey: 'admin.components.table_toolbar.operators.is_not' },
+  { value: 'in', labelKey: 'admin.components.table_toolbar.operators.is_any_of' },
+  { value: 'not_in', labelKey: 'admin.components.table_toolbar.operators.is_none_of' },
+]
+
+const operatorsByType: Record<string, OperatorOption[]> = {
+  string: [
+    // `i_cont` (case-insensitive) rather than `cont` — an admin typing
+    // "2 years" expects to match "2 Years".
+    { value: 'i_cont', labelKey: 'admin.components.table_toolbar.operators.contains' },
+    { value: 'eq', labelKey: 'admin.components.table_toolbar.operators.equals' },
+    { value: 'not_eq', labelKey: 'admin.components.table_toolbar.operators.does_not_equal' },
+    { value: 'start', labelKey: 'admin.components.table_toolbar.operators.starts_with' },
+    { value: 'end', labelKey: 'admin.components.table_toolbar.operators.ends_with' },
+    { value: 'present', labelKey: 'admin.components.table_toolbar.operators.is_set' },
+    { value: 'blank', labelKey: 'admin.components.table_toolbar.operators.is_not_set' },
+  ],
+  enum: [
+    { value: 'eq', labelKey: 'admin.components.table_toolbar.operators.is' },
+    { value: 'not_eq', labelKey: 'admin.components.table_toolbar.operators.is_not' },
+    { value: 'in', labelKey: 'admin.components.table_toolbar.operators.is_any_of' },
+    { value: 'not_in', labelKey: 'admin.components.table_toolbar.operators.is_none_of' },
+  ],
+  boolean: [{ value: 'eq', labelKey: 'admin.components.table_toolbar.operators.is' }],
+  number: [
+    { value: 'eq', labelKey: 'admin.components.table_toolbar.operators.equals' },
+    { value: 'gt', labelKey: 'admin.components.table_toolbar.operators.greater_than' },
+    { value: 'gteq', labelKey: 'admin.components.table_toolbar.operators.greater_than_or_equal' },
+    { value: 'lt', labelKey: 'admin.components.table_toolbar.operators.less_than' },
+    { value: 'lteq', labelKey: 'admin.components.table_toolbar.operators.less_than_or_equal' },
+  ],
+  date: [
+    { value: 'eq', labelKey: 'admin.components.table_toolbar.operators.is' },
+    { value: 'gt', labelKey: 'admin.components.table_toolbar.operators.after' },
+    { value: 'lt', labelKey: 'admin.components.table_toolbar.operators.before' },
+    { value: 'gteq', labelKey: 'admin.components.table_toolbar.operators.on_or_after' },
+    { value: 'lteq', labelKey: 'admin.components.table_toolbar.operators.on_or_before' },
+  ],
+  resource: [
+    { value: 'in', labelKey: 'admin.components.table_toolbar.operators.is_any_of' },
+    { value: 'not_in', labelKey: 'admin.components.table_toolbar.operators.is_none_of' },
+  ],
+  // Tag names round-trip as CSV; `filtersToRansack` decodes to the
+  // `tags_name_in` / `tags_name_not_in` predicate when emitting Ransack.
+  tags: [
+    { value: 'in', labelKey: 'admin.components.table_toolbar.operators.is_any_of' },
+    { value: 'not_in', labelKey: 'admin.components.table_toolbar.operators.is_none_of' },
+  ],
+  // Same shape as `enum` — the value picker just sources its option list
+  // from the currencies / languages of the active store's markets.
+  currency: storeCodeOperators,
+  locale: storeCodeOperators,
+}
+
+function getOperators(type: string) {
+  return operatorsByType[type] || operatorsByType.string
+}
+
+// Operators no longer offered in the picker but still resolvable for display,
+// so filters saved in older URLs keep a readable chip label.
+const legacyOperatorLabelKeys: Record<string, string> = {
+  cont: 'admin.components.table_toolbar.operators.contains',
+}
+
+function getOperatorLabelKey(type: string, operator: string) {
+  return (
+    getOperators(type).find((o) => o.value === operator)?.labelKey ??
+    legacyOperatorLabelKeys[operator]
+  )
+}
+
+const noValueOperators = ['present', 'blank']
+
+/** Stable empty list, so a panel with no store doesn't rebuild `items` (and
+ *  re-emit Base UI Select state) on every render. */
+const noCodes: string[] = []
+
+// ============================================================================
+// TableToolbar
+// ============================================================================
+
+export function TableToolbar({
+  columns,
+  visibleColumns,
+  onVisibleColumnsChange,
+  search,
+  onSearchChange,
+  searchable = true,
+  searchPlaceholder,
+  sort,
+  onSortChange,
+  filters,
+  onFiltersChange,
+  allColumns,
+  hideSort = false,
+}: TableToolbarProps) {
+  const { t } = useTranslation()
+  const [filterOpen, setFilterOpen] = useState(false)
+  // The rule the panel opens on when its chip is clicked; null opens the field list.
+  const [panelRule, setPanelRule] = useState<FilterRule | null>(null)
+
+  const allCols = allColumns ?? columns
+  // Memoize so `FilterPanel`'s `useMemo` deps stay stable across parent
+  // re-renders. Otherwise picking a filter value triggers an `items` change
+  // in the field-picker Select, which Base UI re-emits as a state change.
+  const sortableColumns = useMemo(() => allCols.filter((c) => c.sortable), [allCols])
+  const filterableColumns = useMemo(() => allCols.filter((c) => c.filterable), [allCols])
+  // Only enum and date columns have a control worth surfacing — the rest need
+  // a free-text value, which is what the popover is for.
+  const quickFilterColumns = useMemo(
+    () =>
+      filterableColumns.filter(
+        (c) =>
+          c.quickFilter &&
+          (c.filterType === 'enum' ||
+            c.filterType === 'boolean' ||
+            c.filterType === 'date' ||
+            (c.filterType === 'resource' && !!c.filterResource?.listAll)),
+      ),
+    [filterableColumns],
+  )
+  // A filter a quick control actually displays needs no chip — the control
+  // already states its value, and a second copy would offer two ways to clear
+  // one constraint.
+  //
+  // Matched on operator as well as field, because each control speaks exactly
+  // one: the enum control reads `in`, the date control `gteq`/`lteq`. A
+  // `status not_eq active` set from the panel lands on a field a control owns
+  // but in an operator it cannot show, so it must keep its chip — hiding it
+  // would leave the list filtered by something invisible and unremovable.
+  // The field list leads with what has no quick control. A quick-filtered
+  // field is listed after those, under its own heading, because the panel is
+  // the only place to express an operator its control cannot — a `status is
+  // not active` has no representation in a list of checkboxes.
+  const quickFilterKeys = useMemo(
+    () => new Set(quickFilterColumns.map((c) => c.key)),
+    [quickFilterColumns],
+  )
+  const panelColumns = useMemo(
+    () => filterableColumns.filter((c) => !quickFilterKeys.has(c.key)),
+    [filterableColumns, quickFilterKeys],
+  )
+  const panelKeys = useMemo(() => new Set(panelColumns.map((c) => c.key)), [panelColumns])
+  const chipFilters = useMemo(() => {
+    const covered = new Set(
+      quickFilterColumns.flatMap((c) =>
+        c.filterType === 'date' ? [`${c.key}:gteq`, `${c.key}:lteq`] : [`${c.key}:in`],
+      ),
+    )
+    const visible = filters.filter((f) => !covered.has(`${f.field}:${f.operator}`))
+
+    // A bounded date range is stored as two rules but is one idea, so it shows
+    // as one chip. Two chips read as two unrelated filters, and removing
+    // either leaves a half-range the operator did not ask for — a "between"
+    // that silently became an "after".
+    const entries: { key: string; rules: FilterRule[] }[] = []
+    const rangeIndex = new Map<string, number>()
+    for (const rule of visible) {
+      const isBound = rule.operator === 'gteq' || rule.operator === 'lteq'
+      const column = allCols.find((c) => c.key === rule.field)
+      if (isBound && column?.filterType === 'date') {
+        const existing = rangeIndex.get(rule.field)
+        if (existing !== undefined) {
+          entries[existing].rules.push(rule)
+          continue
+        }
+        rangeIndex.set(rule.field, entries.length)
+        entries.push({ key: rule.id, rules: [rule] })
+        continue
+      }
+      entries.push({ key: rule.id, rules: [rule] })
+    }
+    return entries
+  }, [filters, quickFilterColumns, allCols])
+
+  return (
+    <>
+      {/* One filter row: the quick controls and any filters set the long way
+          sit together, because to the operator they are the same thing — a
+          constraint currently on the list. Splitting them into a "controls"
+          band and an "applied" band asked the reader to learn which of their
+          own filters lives where, and cost a third row of chrome above every
+          table to say it. */}
+      {/* Renders whenever the row has anything to hold. Sort and columns count:
+          without them a table with no filterable columns would lose both
+          controls along with the row. */}
+      {(filterableColumns.length > 0 ||
+        search ||
+        (!hideSort && sortableColumns.length > 0) ||
+        columns.some((c) => c.default !== undefined)) && (
+        <div className="flex items-start gap-2">
+          {/* Only the filters wrap. They grow with what the operator has set,
+              where sort and columns are a fixed pair — letting the whole row
+              wrap dropped those two onto a line of their own the moment the
+              filters filled the width. */}
+          <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
+            {/* Search leads: it is the widest net, and the filters beside it
+              narrow what it finds. Hidden on a phone, where the sidebar drawer
+              already carries a search field — two search boxes stacked in one
+              column is the more confusing cost. A term set on desktop still
+              shows as a chip there, so it never filters a list invisibly. */}
+            {searchable && (
+              <SearchInput
+                value={search}
+                onValueChange={onSearchChange}
+                placeholder={
+                  searchPlaceholder ?? t('admin.components.table_toolbar.search_placeholder')
+                }
+                clearLabel={t('admin.common.clear')}
+                // Widens while in use (focused, or holding a term) so a longer
+                // query stays readable, and settles back once it is let go.
+                className="hidden h-[2.125rem] w-[240px] bg-card text-base transition-[color,background-color,border-color,box-shadow,width] duration-200 ease-out focus-within:w-[320px] has-[input:not(:placeholder-shown)]:w-[320px] motion-reduce:transition-none lg:flex"
+              />
+            )}
+
+            {/* Icon only, like sort and columns: the quick controls beside it
+              already carry the row's words, and the tooltip names it. */}
+            {/* Hidden when every filterable field already has a quick control:
+              the button would open onto an empty list. */}
+            {panelColumns.length > 0 && (
+              <Popover
+                open={filterOpen}
+                onOpenChange={(next) => {
+                  setFilterOpen(next)
+                  // Cleared on opening too: Apply closes the panel through
+                  // `open`, which does not call this, so the trigger is the
+                  // first chance to forget the chip that opened it last.
+                  setPanelRule(null)
+                }}
+              >
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <PopoverTrigger asChild>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="h-11 lg:h-[2.125rem]"
+                        aria-label={t('admin.components.table_toolbar.add_filter')}
+                      >
+                        <ListFilter className="size-4" />
+                      </Button>
+                    </PopoverTrigger>
+                  </TooltipTrigger>
+                  <TooltipContent>{t('admin.components.table_toolbar.add_filter')}</TooltipContent>
+                </Tooltip>
+                {/* The panel sets its own width: `min(480px, …)` for its lists,
+                  so it never runs off a phone, and wider for a date field's
+                  calendar. */}
+                <PopoverContent align="start" className="w-auto max-w-[calc(100vw-1rem)] p-0">
+                  <FilterPanel
+                    key={panelRule?.id ?? ''}
+                    initialRule={panelRule}
+                    columns={panelColumns}
+                    filters={filters}
+                    onApply={(f) => {
+                      onFiltersChange(f)
+                      setFilterOpen(false)
+                    }}
+                    onChange={onFiltersChange}
+                  />
+                </PopoverContent>
+              </Popover>
+            )}
+
+            {quickFilterColumns.map((col) =>
+              col.filterType === 'date' ? (
+                <QuickDateFilter
+                  key={col.key}
+                  column={col}
+                  filters={filters}
+                  onFiltersChange={onFiltersChange}
+                />
+              ) : col.filterType === 'resource' && col.filterResource ? (
+                <QuickResourceFilter
+                  key={col.key}
+                  column={col}
+                  config={col.filterResource}
+                  filters={filters}
+                  onFiltersChange={onFiltersChange}
+                />
+              ) : (
+                <QuickEnumFilter
+                  key={col.key}
+                  column={col}
+                  filters={filters}
+                  onFiltersChange={onFiltersChange}
+                />
+              ),
+            )}
+
+            {/* The search term as a chip, mobile only — the field it came from is
+              hidden there, so this is the only way to see or clear it. */}
+            {search && (
+              <span className="inline-flex h-11 shrink-0 items-center gap-1.5 rounded-md border border-border bg-card py-1 pr-1 pl-2.5 text-base shadow-xs lg:hidden">
+                <span className="text-muted-foreground">
+                  {t('admin.components.table_toolbar.search_placeholder')}
+                </span>
+                <span className="truncate">{search}</span>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label={t('admin.common.clear')}
+                  onClick={() => onSearchChange('')}
+                >
+                  <XIcon className="size-3.5" />
+                </Button>
+              </span>
+            )}
+            {chipFilters.map((entry) => (
+              <FilterChip
+                key={entry.key}
+                rules={entry.rules}
+                col={allCols.find((c) => c.key === entry.rules[0].field)}
+                onEdit={
+                  panelKeys.has(entry.rules[0].field)
+                    ? () => {
+                        setPanelRule(entry.rules[0])
+                        setFilterOpen(true)
+                      }
+                    : undefined
+                }
+                onRemove={() => {
+                  const removing = new Set(entry.rules.map((r) => r.id))
+                  onFiltersChange(filters.filter((f) => !removing.has(f.id)))
+                }}
+              />
+            ))}
+            {filters.length > 0 && (
+              // Stays borderless while everything beside it is outlined: the
+              // rest of the row sets constraints, this one undoes them, and
+              // giving it the same weight would make "clear" look like a fifth
+              // filter. It matches on height so the row still sits on one line.
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className="h-11 text-muted-foreground hover:text-foreground lg:h-[2.125rem]"
+                onClick={() => onFiltersChange([])}
+              >
+                {t('admin.components.table_toolbar.clear_all')}
+              </Button>
+            )}
+          </div>
+
+          {/* Sort and columns close the row from the right. They shape the
+              view rather than narrowing it, so they sit apart from the filters
+              — and stay on the first line however many filters are set. */}
+          <div className="flex shrink-0 items-center gap-2">
+            {/* Hidden when the table is drag-reorderable, since free sorting
+                would defeat the drag. */}
+            {!hideSort && sortableColumns.length > 0 && (
+              <SortMenu columns={sortableColumns} sort={sort} onSortChange={onSortChange} />
+            )}
+
+            {/* Hidden on a phone, where too few columns are visible at once for
+                choosing between them to mean anything. */}
+            <div className="hidden lg:contents">
+              <ColumnSelector
+                columns={columns.filter((c) => c.default !== undefined)}
+                visibleColumns={visibleColumns}
+                onVisibleColumnsChange={onVisibleColumnsChange}
+              />
+            </div>
+          </div>
+        </div>
+      )}
+    </>
+  )
+}
+
+// ============================================================================
+// Filter Chip
+// ============================================================================
+
+function FilterChip({
+  rules,
+  col,
+  onEdit,
+  onRemove,
+}: {
+  /** Usually one rule; a bounded date range is two, shown as one chip. */
+  rules: FilterRule[]
+  col: ColumnDef | undefined
+  /** Reopens the filter panel on this field. Absent when the panel cannot edit it. */
+  onEdit?: () => void
+  onRemove: () => void
+}) {
+  const { t, i18n } = useTranslation()
+  const first = rules[0]
+
+  /**
+   * A `yyyy-MM-dd` bound is a calendar date, not an instant, so it is
+   * formatted in the viewer's locale without a timezone conversion — shifting
+   * it by a zone offset is what would turn "1 August" into "31 July".
+   */
+  function formatDate(value: string) {
+    const [year, month, day] = value.split('-').map(Number)
+    if (!year || !month || !day) return value
+    return new Date(year, month - 1, day).toLocaleDateString(i18n.language, {
+      day: 'numeric',
+      month: 'short',
+      year: 'numeric',
+    })
+  }
+
+  // Read the range's ends rather than assuming an order: the two rules arrive
+  // in whatever order they were applied.
+  const from = rules.find((rule) => rule.operator === 'gteq')?.value
+  const to = rules.find((rule) => rule.operator === 'lteq')?.value
+  const isRange = col?.filterType === 'date' && rules.length > 1 && from && to
+
+  const label = col?.label ?? first.field
+  const opLabelKey = getOperatorLabelKey(col?.filterType ?? 'string', first.operator)
+  const opLabel = opLabelKey ? t(opLabelKey) : first.operator
+  const showValue = !noValueOperators.includes(first.operator)
+  // "Status Ready, Error" reads better than "Status is any of Ready, Error";
+  // every other operator, `not_in` included, still says what it does.
+  const showOperator = first.operator !== 'in'
+  const listedIds = ['in', 'not_in'].includes(first.operator) ? parseFilterIds(first.value) : []
+
+  const body = isRange ? (
+    // "1 Aug – 29 Aug 2026" rather than two chips of ISO bounds: the range
+    // is what was asked for, and it is read far more often than it is
+    // edited.
+    <span>
+      {formatDate(from)} – {formatDate(to)}
+    </span>
+  ) : (
+    <>
+      {showOperator && <span className="text-muted-foreground">{opLabel}</span>}
+      {showValue &&
+        (listedIds.length > 2 ? (
+          <span>{t('admin.components.table_toolbar.n_selected', { count: listedIds.length })}</span>
+        ) : col?.filterType === 'date' ? (
+          <span>{formatDate(first.value)}</span>
+        ) : col?.filterType === 'resource' && col.filterResource ? (
+          <ResourceFilterValue value={first.value} config={col.filterResource} />
+        ) : col?.filterType === 'tags' ? (
+          <span>{listedIds.join(', ')}</span>
+        ) : col?.filterType === 'locale' ? (
+          <span>
+            {listedIds.map((code, index) => (
+              <Fragment key={code}>
+                {index > 0 && ', '}
+                <LocaleLabel code={code} />
+              </Fragment>
+            ))}
+          </span>
+        ) : col?.filterType === 'enum' && col.filterOptions ? (
+          <span>
+            {parseFilterIds(first.value)
+              .map((v) => col.filterOptions?.find((o) => o.value === v)?.label ?? v)
+              .join(', ')}
+          </span>
+        ) : (
+          <span>{first.value}</span>
+        ))}
+    </>
+  )
+
+  return (
+    // Deliberately shaped like the quick-filter buttons beside it rather than
+    // like a Badge: on this row it is the same kind of thing — a constraint
+    // you can see and remove — and a chip that reads as a label instead of a
+    // control invites the reader to look for the control elsewhere.
+    //
+    // So it wears the outline button's own surface — `bg-card`, `shadow-xs`,
+    // `rounded-md` — rather than a `bg-muted` of its own. A filled chip beside
+    // outlined controls reads as a different kind of object, when the only
+    // real difference is that this one is set, which its value already says.
+    <span className="inline-flex h-11 shrink-0 items-center gap-0.5 rounded-md border border-border bg-card pr-1 text-base shadow-xs lg:h-[2.125rem]">
+      {onEdit ? (
+        <button
+          type="button"
+          className="inline-flex h-full items-center gap-1.5 rounded-l-md pl-2.5 pr-1 transition-colors hover:bg-accent/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+          onClick={onEdit}
+        >
+          <span className="text-muted-foreground">{label}</span>
+          {body}
+        </button>
+      ) : (
+        <span className="inline-flex items-center gap-1.5 pl-2.5 pr-1">
+          <span className="text-muted-foreground">{label}</span>
+          {body}
+        </span>
+      )}
+      {/* 20px box around a 12px glyph: the chip's own height caps how large
+          this can be, and the chips are spaced by `gap-2`, which is what the
+          target-size rule asks for when the control itself is under 24px. */}
+      <button
+        type="button"
+        aria-label={t('admin.components.table_toolbar.remove_filter')}
+        className="ml-0.5 inline-flex size-5 shrink-0 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+        onClick={onRemove}
+      >
+        <XIcon className="size-3" />
+      </button>
+    </span>
+  )
+}
+
+/**
+ * The whole option list of a resource small enough to fetch once (`listAll`),
+ * cached under `[queryKey, tenant, 'all']` — the key the resource's own
+ * full-list hook uses, so filters and the rest of the dashboard share one
+ * fetch that the resource's writes invalidate.
+ */
+function useListAll(
+  config: ColumnDef['filterResource'],
+  tenantId: string | undefined,
+  enabled = true,
+) {
+  return useQuery({
+    queryKey: [config?.queryKey, tenantId, 'all'],
+    queryFn: () => config?.listAll?.() ?? Promise.resolve({ data: [] }),
+    enabled: enabled && Boolean(config?.listAll),
+    staleTime: config?.staleTime ?? 60_000,
+  })
+}
+
+/**
+ * Hydrates the CSV id list in a resource filter into human labels. Reuses
+ * the resource's `hydrate` callback so each chip benefits from React Query's
+ * cache (the picker inside the panel populates the same `queryKey`).
+ */
+function ResourceFilterValue({
+  value,
+  config,
+}: {
+  value: string
+  config: NonNullable<ColumnDef['filterResource']>
+}) {
+  const tenantId = useTenantId()
+  const ids = useMemo(() => parseFilterIds(value), [value])
+
+  const all = useListAll(config, tenantId, ids.length > 0)
+  const hydrated = useQuery({
+    // Tenant-scope the cache key so chips don't resolve against another
+    // tenant's hydrate results after a store or seller switch.
+    queryKey: [config.queryKey, tenantId, 'filter-chip', ids],
+    queryFn: () => config.hydrate(ids),
+    enabled: ids.length > 0 && !config.listAll,
+    staleTime: config.staleTime ?? 60_000,
+  })
+  const records = config.listAll ? all.data?.data : hydrated.data?.data
+
+  if (ids.length === 0) return null
+
+  const labels = ids.map((id) => {
+    const record = records?.find((r) => r.id === id)
+    return record ? config.getOptionLabel(record) : id
+  })
+
+  return <span>{labels.join(', ')}</span>
+}
+
+// ============================================================================
+// Sort Dropdown
+// ============================================================================
+
+/**
+ * The sort control: an icon button opening the fields to sort by and the
+ * direction. Exported so other lists — the media picker — sort the same way
+ * the resource tables do.
+ */
+export function SortMenu({
+  columns,
+  sort,
+  onSortChange,
+}: {
+  columns: Pick<ColumnDef, 'key' | 'label'>[]
+  sort: SortOption
+  onSortChange: (sort: SortOption) => void
+}) {
+  const { t } = useTranslation()
+  const currentCol = columns.find((c) => c.key === sort.field)
+
+  return (
+    <DropdownMenu>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <DropdownMenuTrigger asChild>
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-11 lg:h-[2.125rem]"
+              aria-label={t('admin.components.table_toolbar.sort_tooltip')}
+            >
+              <ArrowUpDownIcon className="size-4" />
+            </Button>
+          </DropdownMenuTrigger>
+        </TooltipTrigger>
+        <TooltipContent>
+          {currentCol?.label ?? t('admin.components.table_toolbar.sort_tooltip')}
+        </TooltipContent>
+      </Tooltip>
+      <DropdownMenuContent align="end" className="min-w-48">
+        <DropdownMenuLabel>{t('admin.components.table_toolbar.sort_by')}</DropdownMenuLabel>
+        <DropdownMenuSeparator />
+        <DropdownMenuRadioGroup
+          value={sort.field}
+          onValueChange={(field) => onSortChange({ field, direction: sort.direction })}
+        >
+          {columns.map((col) => (
+            <DropdownMenuRadioItem key={col.key} value={col.key}>
+              {col.label}
+            </DropdownMenuRadioItem>
+          ))}
+        </DropdownMenuRadioGroup>
+        <DropdownMenuSeparator />
+        <DropdownMenuLabel>{t('admin.components.table_toolbar.order')}</DropdownMenuLabel>
+        <DropdownMenuSeparator />
+        <DropdownMenuRadioGroup
+          value={sort.direction}
+          onValueChange={(dir) =>
+            onSortChange({
+              field: sort.field,
+              direction: dir as 'asc' | 'desc',
+            })
+          }
+        >
+          <DropdownMenuRadioItem value="asc">
+            {t('admin.components.table_toolbar.ascending')}
+          </DropdownMenuRadioItem>
+          <DropdownMenuRadioItem value="desc">
+            {t('admin.components.table_toolbar.descending')}
+          </DropdownMenuRadioItem>
+        </DropdownMenuRadioGroup>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  )
+}
+
+// ============================================================================
+// Quick filters
+// ============================================================================
+
+/**
+ * Trigger styling shared by the three quick filters: the standard outline
+ * button, sized to the toolbar. Whether a filter is narrowing the list reads
+ * from its value — "All" against the chosen name or a count — not its border.
+ */
+function quickFilterTriggerClass() {
+  return 'h-11 gap-1.5 lg:h-[2.125rem]'
+}
+
+/** "6/7" on a quick filter that narrows the list. */
+function SelectedCount({ selected, total }: { selected: number; total: number }) {
+  return (
+    <span className="rounded-full bg-muted px-1.5 py-px text-xs font-medium tabular-nums">
+      {selected}/{total}
+    </span>
+  )
+}
+
+/**
+ * Hover shortcut on a multi-select row: "Only" narrows to that value alone,
+ * and on the row that already is the only one, "Select all" widens back.
+ *
+ * Pointer-only and hidden from assistive technology: the row itself stays the
+ * control, and ticking or unticking the others reaches the same state.
+ */
+function RowAction({ label, onSelect }: { label: string; onSelect: () => void }) {
+  return (
+    <span
+      aria-hidden
+      data-slot="filter-row-action"
+      className="ml-auto shrink-0 cursor-pointer pl-3 text-xs text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover/row:opacity-100 group-data-[highlighted]/checkbox-item:opacity-100"
+      // Stopped here so the row underneath does not also toggle.
+      onMouseUp={(event) => event.stopPropagation()}
+      onClick={(event) => {
+        event.preventDefault()
+        event.stopPropagation()
+        onSelect()
+      }}
+    >
+      {label}
+    </span>
+  )
+}
+
+/**
+ * The menu rows shared by the enum and resource quick filters. `selected` is
+ * what the list currently shows, which is every value when nothing is set.
+ */
+function QuickFilterItems({
+  options,
+  selected,
+  dots,
+  onChange,
+}: {
+  options: { value: string; label: string }[]
+  selected: string[]
+  dots: boolean
+  onChange: (values: string[]) => void
+}) {
+  const { t } = useTranslation()
+  return options.map((option) => {
+    const checked = selected.includes(option.value)
+    const sole = checked && selected.length === 1
+    return (
+      <DropdownMenuCheckboxItem
+        key={option.value}
+        checked={checked}
+        onCheckedChange={(next) =>
+          onChange(next ? [...selected, option.value] : selected.filter((v) => v !== option.value))
+        }
+      >
+        {dots && <StatusDot status={option.value} />}
+        <span className="truncate">{option.label}</span>
+        {options.length > 1 && (
+          <RowAction
+            label={t(
+              sole
+                ? 'admin.components.table_toolbar.select_all'
+                : 'admin.components.table_toolbar.only',
+            )}
+            onSelect={() => onChange(sole ? options.map((o) => o.value) : [option.value])}
+          />
+        )}
+      </DropdownMenuCheckboxItem>
+    )
+  })
+}
+
+/**
+ * Always-visible control for one heavily-used filter.
+ *
+ * These write ordinary `FilterRule`s, so a status set here is indistinguishable
+ * from one set in the popover — same URL state, same chips, same export. The
+ * difference is only how many clicks it took.
+ *
+ * Unlike the popover, a quick filter applies on change rather than on Apply: a
+ * single toggle is cheap to undo, so making the operator confirm it costs more
+ * than it protects. The popover keeps its Apply, where several half-edited rows
+ * would otherwise each fire a request.
+ */
+function QuickEnumFilter({
+  column,
+  filters,
+  onFiltersChange,
+}: {
+  column: ColumnDef
+  filters: FilterRule[]
+  onFiltersChange: (filters: FilterRule[]) => void
+}) {
+  const { t } = useTranslation()
+  // A boolean column carries no `filterOptions` — its two values are fixed, so
+  // the control supplies them. `booleanLabels` names them where the domain has
+  // better words than Yes and No.
+  const options = useMemo(
+    () =>
+      column.filterType === 'boolean'
+        ? [
+            { value: 'true', label: column.booleanLabels?.true ?? t('admin.common.yes') },
+            { value: 'false', label: column.booleanLabels?.false ?? t('admin.common.no') },
+          ]
+        : (column.filterOptions ?? []),
+    [column.filterType, column.filterOptions, column.booleanLabels, t],
+  )
+  const existing = filters.find((f) => f.field === column.key && f.operator === 'in')
+
+  // No rule means no constraint, which is every option — not none. Showing
+  // "0/7" for an unfiltered list would read as "nothing matches".
+  const selected = existing ? parseFilterIds(existing.value) : options.map((o) => o.value)
+  const allSelected = selected.length === options.length
+
+  const apply = useCallback(
+    (values: string[]) => {
+      const others = filters.filter((f) => !(f.field === column.key && f.operator === 'in'))
+      // Selecting everything is the same as filtering by nothing, so drop the
+      // rule instead of listing every value in the URL.
+      if (values.length === 0 || values.length === options.length) {
+        onFiltersChange(others)
+        return
+      }
+      onFiltersChange([
+        ...others,
+        {
+          id: existing?.id ?? randomUUID(),
+          field: column.key,
+          operator: 'in',
+          value: values.join(','),
+        },
+      ])
+    },
+    [filters, column.key, options.length, existing?.id, onFiltersChange],
+  )
+
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button variant="outline" size="sm" className={quickFilterTriggerClass()}>
+          <span className="text-muted-foreground">{column.label}</span>
+          {allSelected ? (
+            <span>{t('admin.common.all')}</span>
+          ) : selected.length === 1 ? (
+            <span className="max-w-40 truncate">
+              {options.find((o) => o.value === selected[0])?.label}
+            </span>
+          ) : (
+            <SelectedCount selected={selected.length} total={options.length} />
+          )}
+          <ChevronsUpDownIcon className="size-3.5 text-muted-foreground" />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="start" className="min-w-56">
+        <QuickFilterItems options={options} selected={selected} dots onChange={apply} />
+      </DropdownMenuContent>
+    </DropdownMenu>
+  )
+}
+
+/**
+ * Picks records for one `resource` column — a warehouse, a supplier — without
+ * opening the filter panel.
+ *
+ * Where the config can list the resource whole (`listAll`), this is the same
+ * checkbox menu the enum quick filter uses: for a store's four warehouses, a
+ * list to tick is faster than a box to type into, and it matches the control
+ * next to it. Without `listAll` the column stays in the filter panel, where
+ * the search-driven picker belongs.
+ *
+ * Like the enum control it applies on change: a single pick is cheap to undo.
+ */
+function QuickResourceFilter({
+  column,
+  config,
+  filters,
+  onFiltersChange,
+}: {
+  column: ColumnDef
+  config: NonNullable<ColumnDef['filterResource']>
+  filters: FilterRule[]
+  onFiltersChange: (filters: FilterRule[]) => void
+}) {
+  const { t } = useTranslation()
+  const tenantId = useTenantId()
+  const existing = filters.find((f) => f.field === column.key && f.operator === 'in')
+  const existingValue = existing?.value
+  const selected = useMemo(
+    () => (existingValue ? parseFilterIds(existingValue) : []),
+    [existingValue],
+  )
+
+  const { data } = useListAll(config, tenantId)
+  const options = useMemo(
+    () =>
+      (data?.data ?? []).map((item) => ({ value: item.id, label: config.getOptionLabel(item) })),
+    [data, config.getOptionLabel],
+  )
+
+  const apply = useCallback(
+    (values: string[]) => {
+      const others = filters.filter((f) => !(f.field === column.key && f.operator === 'in'))
+      // Everything selected is the same as no constraint, so drop the rule
+      // rather than listing every id in the URL.
+      if (values.length === 0 || values.length === options.length) {
+        onFiltersChange(others)
+        return
+      }
+      onFiltersChange([
+        ...others,
+        {
+          id: existing?.id ?? randomUUID(),
+          field: column.key,
+          operator: 'in',
+          value: values.join(','),
+        },
+      ])
+    },
+    [filters, column.key, options.length, existing?.id, onFiltersChange],
+  )
+
+  // No rule means no constraint, which is every option — not none.
+  const active = selected.length > 0 ? selected : options.map((o) => o.value)
+  const summary =
+    selected.length === 0 ? (
+      <span>{t('admin.common.all')}</span>
+    ) : selected.length === 1 ? (
+      <span className="max-w-40 truncate">
+        {options.find((o) => o.value === selected[0])?.label ?? '1'}
+      </span>
+    ) : (
+      <SelectedCount selected={selected.length} total={options.length} />
+    )
+
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button variant="outline" size="sm" className={quickFilterTriggerClass()}>
+          <span className="text-muted-foreground">{column.label}</span>
+          {summary}
+          <ChevronsUpDownIcon className="size-3.5 text-muted-foreground" />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="start" className="min-w-56">
+        <QuickFilterItems options={options} selected={active} dots={false} onChange={apply} />
+      </DropdownMenuContent>
+    </DropdownMenu>
+  )
+}
+
+/**
+ * Relative date presets for one date column.
+ *
+ * A preset is a single choice rather than a range builder, which keeps it one
+ * `FilterRule` and therefore one chip. Bounded ranges — "last month", or
+ * anything picked by hand — need both ends, so those write two rules and read
+ * back as two chips, which is honest about what was asked for.
+ */
+function QuickDateFilter({
+  column,
+  filters,
+  onFiltersChange,
+}: {
+  column: ColumnDef
+  filters: FilterRule[]
+  onFiltersChange: (filters: FilterRule[]) => void
+}) {
+  const { t, i18n } = useTranslation()
+  const timezone = useFilterTimezone()
+  const from = filters.find((f) => f.field === column.key && f.operator === 'gteq')
+  const to = filters.find((f) => f.field === column.key && f.operator === 'lteq')
+  const active = matchDatePreset({ from: from?.value ?? null, to: to?.value ?? null }, timezone)
+  const [open, setOpen] = useState(false)
+
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
+        <Button variant="outline" size="sm" className={quickFilterTriggerClass()}>
+          <span className="text-muted-foreground">{column.label}</span>
+          <span>
+            {active === 'custom'
+              ? formatDateBounds(from?.value ?? null, to?.value ?? null, i18n.language)
+              : t(`admin.components.table_toolbar.date_presets.${active}`)}
+          </span>
+          <ChevronsUpDownIcon className="size-3.5 text-muted-foreground" />
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent align="start" className="w-auto max-w-[calc(100vw-1rem)] p-0">
+        <ColumnDateRange
+          field={column.key}
+          filters={filters}
+          onApply={(next) => {
+            onFiltersChange(next)
+            setOpen(false)
+          }}
+        />
+      </PopoverContent>
+    </Popover>
+  )
+}
+
+/** A panel with no store context (a seller's) falls back to the viewer's zone
+ *  rather than refusing to offer presets. */
+function useFilterTimezone(): string {
+  const store = useOptionalStore()
+  return store?.timezone ?? Intl.DateTimeFormat().resolvedOptions().timeZone ?? 'UTC'
+}
+
+/**
+ * Presets and a range calendar for one date column, used by its quick filter
+ * and by the filter panel alike, so a range is picked the same way in both.
+ * `onApply` gets the whole filter list with this column's bounds replaced.
+ */
+function ColumnDateRange({
+  field,
+  filters,
+  onApply,
+}: {
+  field: string
+  filters: FilterRule[]
+  onApply: (filters: FilterRule[]) => void
+}) {
+  const { t } = useTranslation()
+  const timezone = useFilterTimezone()
+  const from = filters.find((f) => f.field === field && f.operator === 'gteq')
+  const to = filters.find((f) => f.field === field && f.operator === 'lteq')
+  const active = matchDatePreset({ from: from?.value ?? null, to: to?.value ?? null }, timezone)
+
+  /** Replace this column's bounds. Either end may be null for an open range. */
+  function applyRange(rangeFrom: string | null, rangeTo: string | null) {
+    const next = filters.filter(
+      (f) => !(f.field === field && (f.operator === 'gteq' || f.operator === 'lteq')),
+    )
+    if (rangeFrom) next.push({ id: randomUUID(), field, operator: 'gteq', value: rangeFrom })
+    if (rangeTo) next.push({ id: randomUUID(), field, operator: 'lteq', value: rangeTo })
+    onApply(next)
+  }
+
+  return (
+    <DateRangePanel
+      // Reseeds the calendar whenever the applied range changes, even if
+      // the popover reopens before its closing animation unmounts it.
+      key={`${from?.value}:${to?.value}`}
+      presets={DATE_PRESET_KEYS.map((key) => ({
+        key,
+        label: t(`admin.components.table_toolbar.date_presets.${key}`),
+      }))}
+      activePreset={active}
+      onPresetSelect={(preset) => {
+        const range = resolveDatePreset(preset, timezone)
+        applyRange(range.from, range.to)
+      }}
+      // A range restored from a URL may be open on one side; the calendar
+      // highlights the end it has.
+      initialRange={
+        from?.value || to?.value
+          ? { from: parseDay(from?.value ?? to?.value), to: parseDay(to?.value) }
+          : undefined
+      }
+      onApply={(range) => applyRange(formatDay(range.from), formatDay(range.to))}
+    />
+  )
+}
+
+/** Filter values are store-calendar dates (`yyyy-MM-dd`), read as local days. */
+function parseDay(value: string | undefined): Date | undefined {
+  return value ? parse(value, 'yyyy-MM-dd', new Date()) : undefined
+}
+
+function formatDay(date: Date): string {
+  return format(date, 'yyyy-MM-dd')
+}
+
+/** "Nov 1 – Nov 5", or one side alone for an open range. */
+function formatDateBounds(from: string | null, to: string | null, language: string): string {
+  const label = (value: string | null) =>
+    value
+      ? (parseDay(value)?.toLocaleDateString(language, { day: 'numeric', month: 'short' }) ?? '')
+      : ''
+  if (from && to && from === to) return label(from)
+  return `${label(from)} – ${label(to)}`.trim()
+}
+
+// ============================================================================
+// Column Selector
+// ============================================================================
+
+function ColumnSelector({
+  columns,
+  visibleColumns,
+  onVisibleColumnsChange,
+}: {
+  columns: ColumnDef[]
+  visibleColumns: string[]
+  onVisibleColumnsChange: (columns: string[]) => void
+}) {
+  const { t } = useTranslation()
+  const [density, setDensity] = useTableDensity()
+  const defaults = columns.filter((c) => c.default).map((c) => c.key)
+
+  return (
+    <DropdownMenu>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <DropdownMenuTrigger asChild>
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-11 lg:h-[2.125rem]"
+              aria-label={t('admin.components.table_toolbar.columns_tooltip')}
+            >
+              <Columns3Icon className="size-4" />
+            </Button>
+          </DropdownMenuTrigger>
+        </TooltipTrigger>
+        <TooltipContent>{t('admin.components.table_toolbar.columns_tooltip')}</TooltipContent>
+      </Tooltip>
+      <DropdownMenuContent align="end" className="min-w-48">
+        <DropdownMenuLabel>{t('admin.components.table_toolbar.visible_columns')}</DropdownMenuLabel>
+        <DropdownMenuSeparator />
+        {columns.map((col) => (
+          <DropdownMenuCheckboxItem
+            key={col.key}
+            checked={visibleColumns.includes(col.key)}
+            onCheckedChange={(checked) => {
+              onVisibleColumnsChange(
+                checked
+                  ? [...visibleColumns, col.key]
+                  : visibleColumns.filter((k) => k !== col.key),
+              )
+            }}
+            onSelect={(e) => e.preventDefault()}
+          >
+            {col.label}
+          </DropdownMenuCheckboxItem>
+        ))}
+        <DropdownMenuSeparator />
+        <DropdownMenuLabel>{t('admin.components.table_toolbar.row_density')}</DropdownMenuLabel>
+        <DropdownMenuRadioGroup
+          value={density}
+          onValueChange={(value) => setDensity(value as TableDensity)}
+        >
+          <DropdownMenuRadioItem value="comfortable" closeOnClick={false}>
+            {t('admin.components.table_toolbar.density_comfortable')}
+          </DropdownMenuRadioItem>
+          <DropdownMenuRadioItem value="compact" closeOnClick={false}>
+            {t('admin.components.table_toolbar.density_compact')}
+          </DropdownMenuRadioItem>
+        </DropdownMenuRadioGroup>
+        <DropdownMenuSeparator />
+        <Button
+          variant="ghost"
+          size="sm"
+          className="w-full justify-center"
+          onClick={() => onVisibleColumnsChange(defaults)}
+        >
+          {t('admin.components.table_toolbar.reset_to_default')}
+        </Button>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  )
+}
+
+// ============================================================================
+// Filter Drawer
+// ============================================================================
+
+// 10px in from a 6px list inset puts row text 16px from the panel's edge,
+// in line with the header's label.
+const panelRowClass =
+  'group/row flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50'
+
+/** One value in a multi-select list of the filter panel. */
+function CheckRow({
+  checked,
+  sole,
+  onToggle,
+  onOnly,
+  children,
+}: {
+  checked: boolean
+  /** The only value ticked — its "Only" would do nothing, so it offers none. */
+  sole: boolean
+  onToggle: () => void
+  onOnly: () => void
+  children: ReactNode
+}) {
+  const { t } = useTranslation()
+  return (
+    <button
+      type="button"
+      data-slot="filter-panel-item"
+      aria-pressed={checked}
+      className={panelRowClass}
+      onClick={onToggle}
+    >
+      <Checkbox checked={checked} tabIndex={-1} className="pointer-events-none" />
+      {children}
+      {!sole && <RowAction label={t('admin.components.table_toolbar.only')} onSelect={onOnly} />}
+    </button>
+  )
+}
+
+/** "Any Status": the row that clears this field, ticked while nothing is set. */
+function AnyRow({
+  label,
+  active,
+  onSelect,
+}: {
+  label: string
+  active: boolean
+  onSelect: () => void
+}) {
+  return (
+    <button
+      type="button"
+      data-slot="filter-panel-item"
+      className={cn(panelRowClass, 'justify-between')}
+      onClick={onSelect}
+    >
+      {label}
+      {active && <CheckIcon className="size-4 shrink-0" />}
+    </button>
+  )
+}
+/**
+ * Inline, searchable, multi-select list of a filter's candidate values.
+ *
+ * Tags and resources previously rendered a combobox, which opened its own
+ * dropdown inside a panel that already had the room to show the options — a
+ * popup over a popup, to display a list. Here the list is simply the panel's
+ * body, filtered by the search box already in its header.
+ *
+ * Both types are "is any of" by nature, so there is no operator to choose:
+ * ticking two tags means either, which is the only reading a set of tags has.
+ */
+function InlineValueList({
+  column,
+  tenantId,
+  query,
+  selected,
+  onToggle,
+  onOnly,
+}: {
+  column: ColumnDef
+  tenantId: string | undefined
+  query: string
+  selected: string[]
+  onToggle: (value: string) => void
+  onOnly: (value: string) => void
+}) {
+  const { t } = useTranslation()
+  const { isAuthenticated } = useAuth()
+  const tagsClient = getApiClient().tags
+  const isTags = column.filterType === 'tags'
+  const isCurrency = column.filterType === 'currency'
+  const isLocale = column.filterType === 'locale'
+  // Store codes are listed client-side from the store payload, never searched.
+  const isStoreCode = isCurrency || isLocale
+  // `filterType: 'currency'` / `'locale'` are only declared by tables in the
+  // operator's dashboard, which always has a store. Reading it optionally
+  // keeps the panel mountable in one that has none.
+  const store = useOptionalStore()
+  const storeCodes = (isCurrency ? store?.currencies : isLocale ? store?.locales : null) ?? noCodes
+  const localeLabel = useLocaleLabel()
+
+  // Tags arrive as one list and are filtered client-side; resources are
+  // searched server-side, since their vocabulary is unbounded.
+  const tags = useQuery({
+    // Tenant-scoped like the resource query below: tag vocabularies are
+    // per-store, and a shared key would serve one store's tags to the next for
+    // as long as the result stays fresh.
+    queryKey: ['panel-tags', tenantId, column.taggableType],
+    queryFn: () => tagsClient?.list({ taggable_type: column.taggableType as TaggableType }),
+    enabled: isTags && isAuthenticated && Boolean(tagsClient),
+    // One list, filtered client-side, and it rarely changes — worth holding
+    // for the session so reopening the panel never refetches.
+    staleTime: 5 * 60_000,
+    gcTime: 30 * 60_000,
+  })
+
+  // Deferred so typing stays responsive: the input updates immediately while
+  // the list re-renders at React's convenience, matching the resource picker
+  // sheet. It lowers request volume under load rather than guaranteeing it —
+  // React may still let every keystroke through on a fast machine. What keeps
+  // that cheap is the cache: repeated prefixes are served from it, and only a
+  // genuinely new query reaches the network.
+  const deferredQuery = useDeferredValue(query)
+
+  // A resource listed whole is fetched once and narrowed here as the operator
+  // types; anything larger is searched server-side.
+  const listed = Boolean(column.filterResource?.listAll)
+  const all = useListAll(column.filterResource, tenantId, !isTags && !isStoreCode)
+
+  const resources = useQuery({
+    // Tenant-scoped so a store or seller switch cannot reuse the previous
+    // tenant's results.
+    queryKey: [column.filterResource?.queryKey, tenantId, 'panel-resource-filter', deferredQuery],
+    queryFn: () => column.filterResource?.search(deferredQuery),
+    enabled: !isTags && !isStoreCode && !listed && Boolean(column.filterResource),
+    // These lists are reference data an operator reopens repeatedly while
+    // narrowing one list, and the result is small now that only the displayed
+    // fields are requested. Holding it for the session keeps reopening the
+    // panel instant; `gcTime` outlives the unmount between opens.
+    staleTime: column.filterResource?.staleTime ?? 5 * 60_000,
+    gcTime: Math.max(30 * 60_000, column.filterResource?.staleTime ?? 0),
+    // Keeps the previous matches on screen while the next query resolves, so
+    // the list does not blank on every keystroke.
+    //
+    // Only within one field of one tenant: the second argument is the query
+    // those results came from, so a change of store, seller or filter column
+    // drops them instead of briefly offering another tenant's records as
+    // though they were this one's.
+    placeholderData: (previous, previousQuery) => {
+      const [previousResource, previousTenant] = (previousQuery?.queryKey ?? []) as unknown[]
+      const sameScope =
+        previousResource === column.filterResource?.queryKey && previousTenant === tenantId
+      return sameScope ? previous : undefined
+    },
+  })
+
+  const options = useMemo(() => {
+    if (isStoreCode) {
+      const needle = query.trim().toLowerCase()
+      return storeCodes
+        .map((code) => ({
+          value: code,
+          label: isLocale ? localeLabel(code) : code,
+        }))
+        .filter((option) => !needle || option.label.toLowerCase().includes(needle))
+    }
+    if (isTags) {
+      const names = tags.data?.data?.map((tag) => tag.name) ?? []
+      const needle = query.trim().toLowerCase()
+      const matching = needle ? names.filter((name) => name.toLowerCase().includes(needle)) : names
+      return matching.map((name) => ({ value: name, label: name }))
+    }
+    const config = column.filterResource
+    if (!config) return []
+    const records = (listed ? all.data?.data : resources.data?.data) ?? []
+    const resourceOptions = records.map((record) => ({
+      value: record.id,
+      label: config.getOptionLabel(record),
+    }))
+    if (!listed) return resourceOptions
+    const needle = query.trim().toLowerCase()
+    return resourceOptions.filter(
+      (option) => !needle || option.label.toLowerCase().includes(needle),
+    )
+  }, [
+    listed,
+    all.data,
+    isStoreCode,
+    isLocale,
+    storeCodes,
+    localeLabel,
+    isTags,
+    tags.data,
+    resources.data,
+    column.filterResource,
+    query,
+  ])
+
+  // Values already selected when the list opens ride at the top, so an active
+  // filter is visible without scrolling. The set is frozen at mount: ticking a
+  // box must not move rows under the pointer.
+  const [pinned] = useState(() => selected)
+  const ordered = useMemo(() => {
+    const chosen = options.filter((option) => pinned.includes(option.value))
+    const rest = options.filter((option) => !pinned.includes(option.value))
+    // Not truncated: a list cut at ten looks like a list of ten, and a
+    // vocabulary of forty tags would silently lose thirty with nothing on
+    // screen to say so. The container scrolls instead, so the scrollbar
+    // reports how much more there is — and searching narrows it.
+    return [...chosen, ...rest]
+  }, [options, pinned])
+
+  if (!isStoreCode && (tags.isLoading || resources.isLoading || all.isLoading)) {
+    return (
+      <p className="px-2 py-6 text-center text-muted-foreground">{t('admin.common.loading')}</p>
+    )
+  }
+
+  if (ordered.length === 0) {
+    return (
+      <p className="px-2 py-6 text-center text-muted-foreground">{t('admin.common.no_results')}</p>
+    )
+  }
+
+  return (
+    <>
+      {ordered.map((option) => (
+        <CheckRow
+          key={option.value}
+          checked={selected.includes(option.value)}
+          sole={selected.length === 1 && selected[0] === option.value}
+          onToggle={() => onToggle(option.value)}
+          onOnly={() => onOnly(option.value)}
+        >
+          <span className="truncate">{option.label}</span>
+        </CheckRow>
+      ))}
+    </>
+  )
+}
+
+/**
+ * The advanced filter panel, in two stages.
+ *
+ * Stage one lists the fields. Stage two commits to one of them and shows its
+ * values, with the field name kept in the header as the way back to stage one.
+ *
+ * One filter at a time, deliberately: filters compose by being applied in
+ * succession, and each one lands as a chip on the toolbar row, so the row is
+ * the list of what is active. A panel that also held several half-built rows
+ * duplicated that list in a second place, in a different notation.
+ */
+function FilterPanel({
+  initialRule = null,
+  columns,
+  filters,
+  onApply,
+  onChange,
+}: {
+  /** Open straight on this rule's field and value, as when its chip is clicked. */
+  initialRule?: FilterRule | null
+  /** The fields with no quick control of their own. A field that has one is
+   *  filtered there alone — its checkbox list already says "is" and "is not",
+   *  so offering it here too only listed the same field twice. */
+  columns: ColumnDef[]
+  filters: FilterRule[]
+  /** Commit and close — for the filters that are finished in one action. */
+  onApply: (filters: FilterRule[]) => void
+  /** Update without closing — for a multi-select the user is still building. */
+  onChange: (filters: FilterRule[]) => void
+}) {
+  const { t } = useTranslation()
+  const tenantId = useTenantId()
+  /**
+   * What picking a field starts from: the rule already set on it, so reopening
+   * a filter shows the values it is filtering by. Without this a list reads as
+   * empty, and the next tick would replace the existing set rather than extend
+   * it.
+   */
+  function seedFor(key: string | null, rule?: FilterRule | null) {
+    const col = columns.find((c) => c.key === key)
+    if (!col) return { operator: '', value: '', editing: null }
+    const ops = getOperators(col.filterType ?? 'string')
+    const editable = (f: FilterRule) =>
+      f.field === key && col.filterType !== 'date' && ops.some((o) => o.value === f.operator)
+    // The clicked chip's own rule first: a field can carry two typed rules,
+    // and editing "equals b" must not open on "contains a".
+    const applied =
+      (rule && editable(rule) ? rule : undefined) ??
+      filters.find((f) => f.field === key && f.operator === 'in') ??
+      filters.find(editable)
+    return {
+      operator: applied && applied.operator !== 'in' ? applied.operator : ops[0].value,
+      value: applied?.value ?? '',
+      // The typed rule being edited, replaced on Apply even if its operator
+      // changes — otherwise "contains a" edited to "equals b" keeps both.
+      editing: applied && applied.operator !== 'in' ? applied.id : null,
+    }
+  }
+  const [initial] = useState(() => seedFor(initialRule?.field ?? null, initialRule))
+
+  // The field being built, or null while the field list is showing.
+  const [field, setField] = useState<string | null>(initialRule?.field ?? null)
+  const [operator, setOperator] = useState(initial.operator)
+  const [value, setValue] = useState(initial.value)
+  const [editing, setEditing] = useState<string | null>(initial.editing)
+  const [query, setQuery] = useState('')
+
+  const column = columns.find((c) => c.key === field)
+  const type = column?.filterType ?? 'string'
+  const operators = useMemo(
+    () => getOperators(type).map((op) => ({ value: op.value, label: t(op.labelKey) })),
+    [type, t],
+  )
+
+  // Types whose values are a fixed list the panel can render inline. Anything
+  // else needs its own control (an autocomplete, a date picker, a text box),
+  // which is what the second branch below draws.
+  // Types whose values are chosen from a list rather than typed. `multi` ones
+  // accumulate a set and need an explicit Apply; the single ones commit on the
+  // click that picks them.
+  const multi = type === 'tags' || type === 'resource' || type === 'currency' || type === 'locale'
+  // An enum is ticked like the others and sent as `in`. Not one backed by a
+  // Ransack scope: a scope takes the value as its argument, and most of them
+  // answer a yes-or-no question that a list of values would not fit.
+  const enumMulti = type === 'enum' && !column?.ransackScope
+  const checked = parseFilterIds(value)
+  // Dates are their own shape: a list of relative presets, with the calendar
+  // behind "custom". Same presets the quick filter offers, so a range means
+  // the same thing wherever it was set.
+  const dated = type === 'date'
+  const listed = type === 'enum' || type === 'boolean' || multi
+  // The header search filters the list below it, so it earns its place only
+  // when there is a list: the fields, or a list-shaped type's values.
+  const searchable = (!field || listed) && !dated
+  const listOptions = useMemo(() => {
+    const options =
+      type === 'boolean'
+        ? [
+            { value: 'true', label: column?.booleanLabels?.true ?? t('admin.common.yes') },
+            { value: 'false', label: column?.booleanLabels?.false ?? t('admin.common.no') },
+          ]
+        : (column?.filterOptions ?? [])
+    if (!query.trim()) return options
+    const needle = query.trim().toLowerCase()
+    return options.filter((o) => o.label.toLowerCase().includes(needle))
+  }, [type, column?.filterOptions, column?.booleanLabels, query, t])
+
+  const visibleFields = useMemo(() => {
+    const needle = query.trim().toLowerCase()
+    const matching = (list: ColumnDef[]) =>
+      needle ? list.filter((c) => c.label.toLowerCase().includes(needle)) : list
+    return matching(columns)
+  }, [columns, query])
+
+  function chooseField(key: string) {
+    const seed = seedFor(key)
+    setField(key)
+    setOperator(seed.operator)
+    setValue(seed.value)
+    setEditing(seed.editing)
+    setQuery('')
+  }
+
+  /** Back to the field list. Clears the half-built rule with it — the search
+   *  box is shared between the two stages, and a value left behind would be
+   *  seeded into whichever field is picked next. */
+  function clearField() {
+    setField(null)
+    setOperator('')
+    setValue('')
+    setEditing(null)
+    setQuery('')
+  }
+
+  /**
+   * Apply this filter and close.
+   *
+   * Replaces any rule already set on the same field and operator rather than
+   * adding a second: picking "Status is Active", then reopening and picking
+   * "Status is Draft", would otherwise leave two `eq` rules that the server
+   * ANDs together into nothing. Rules on the same field with a *different*
+   * operator survive — `created_at after X` and `created_at before Y` are a
+   * range, not a contradiction.
+   */
+  function commit(nextValue: string, nextOperator = operator) {
+    if (!field) return
+    if (!noValueOperators.includes(nextOperator) && nextValue.trim() === '') return
+    const others = filters.filter(
+      (f) => !(f.field === field && f.operator === nextOperator) && f.id !== editing,
+    )
+    onApply([...others, { id: randomUUID(), field, operator: nextOperator, value: nextValue }])
+  }
+
+  /**
+   * Apply a multi-select as it is ticked, keeping the panel open.
+   *
+   * Replaces this field's rule rather than appending, so ticking three tags
+   * leaves one rule listing three values instead of three rules — and
+   * unticking the last one removes it, rather than leaving an empty rule that
+   * would match nothing.
+   */
+  function setValues(next: string[]) {
+    if (!field) return
+    setValue(next.join(','))
+    // A reopened `status is active` is shown ticked, so the set that replaces
+    // it must replace that rule too, or the old `eq` keeps narrowing the list.
+    // Only for enums: a `not_in` tag rule is a separate constraint.
+    const replaced = enumMulti ? editing : null
+    setEditing(null)
+
+    const others = filters.filter(
+      (f) => !(f.field === field && f.operator === 'in') && f.id !== replaced,
+    )
+    onChange(
+      next.length === 0
+        ? others
+        : [...others, { id: randomUUID(), field, operator: 'in', value: next.join(',') }],
+    )
+  }
+
+  /** "Any …": no constraint on this field at all, `is not` rules included. */
+  function clearValues() {
+    setValue('')
+    setEditing(null)
+    onChange(filters.filter((f) => f.field !== field))
+  }
+
+  function toggleValue(option: string) {
+    setValues(checked.includes(option) ? checked.filter((v) => v !== option) : [...checked, option])
+  }
+
+  return (
+    // `rounded-xl` to match the popover, and `overflow-hidden` to enforce it:
+    // the panel is mounted with `p-0`, so the header meets the popover's edge
+    // directly and every square background inside it — the back button's hover
+    // fill, the search field's own ground — paints over the rounded corner and
+    // squares it off. Clipping here fixes both top corners once, rather than
+    // asking each child to round the one it happens to touch.
+    <div
+      className={cn(
+        'flex flex-col overflow-hidden rounded-xl',
+        // A date field widens to fit the presets beside a two-month calendar.
+        field && dated ? 'w-auto' : 'w-[min(480px,calc(100vw-1rem))]',
+      )}
+    >
+      {/* Header. Before a field is chosen this is a label and a search box over
+          the field list; after, the label becomes the way back to it. */}
+      <div className="flex items-stretch border-b text-base">
+        {field ? (
+          // The field name is the way back to the field list.
+          <button
+            type="button"
+            className="flex shrink-0 cursor-pointer items-center gap-1.5 rounded-none border-r px-4 py-2.5 font-medium transition-colors hover:bg-accent focus-visible:bg-accent focus-visible:outline-none"
+            onClick={clearField}
+          >
+            <ChevronLeftIcon className="size-4 shrink-0 text-muted-foreground" />
+            {column?.label ?? field}
+          </button>
+        ) : (
+          <span className="flex shrink-0 items-center border-r px-4 py-2.5 font-medium">
+            {t('admin.components.table_toolbar.filter_by')}
+          </span>
+        )}
+        {/* Only where it filters something: a list of fields, or a list of
+            values. The other value types bring their own input — a resource
+            autocomplete, a date picker, a text box — and a second search box
+            above one of those searches nothing. */}
+        {searchable ? (
+          <Input
+            autoFocus
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder={t('admin.components.table_toolbar.filter_to_placeholder')}
+            className="min-w-0 flex-1 rounded-none border-0 px-3 shadow-none focus:shadow-none"
+          />
+        ) : (
+          <span className="flex-1" />
+        )}
+        {/* Clears the search box, and only that. It used to close the whole
+            panel, sitting a few pixels from a text field it looked like it
+            belonged to — so the one gesture that reliably means "empty this
+            field" threw away the filter being built instead. Closing is what
+            Escape and a click outside already do, and neither is ambiguous. */}
+        {searchable && query ? (
+          <Button
+            type="button"
+            onClick={() => setQuery('')}
+            size="icon-sm"
+            variant="ghost"
+            aria-label={t('admin.common.clear')}
+            className="m-1 shrink-0"
+          >
+            <XIcon className="size-4" />
+          </Button>
+        ) : null}
+      </div>
+
+      {/* Scrolls, and says so. `overscroll-contain` keeps a flick at the end of
+          the list from scrolling the page behind the panel; the themed
+          scrollbar the popover supplies is what tells the reader there is more
+          below, since the rows themselves end flush at the container's edge. */}
+      <div
+        className={cn(
+          'text-base',
+          // The calendar sizes itself; the lists scroll inside a capped body.
+          !(field && dated) &&
+            'max-h-[320px] overflow-y-auto overscroll-contain p-1.5 themed-scrollbar',
+        )}
+      >
+        {/* Stage one: pick a subject. */}
+        {!field &&
+          visibleFields.map((col) => (
+            <button
+              key={col.key}
+              type="button"
+              data-slot="filter-panel-item"
+              className={cn(panelRowClass, 'justify-between')}
+              onClick={() => chooseField(col.key)}
+            >
+              {col.label}
+              <ChevronRightIcon className="size-3.5 shrink-0 text-muted-foreground" />
+            </button>
+          ))}
+
+        {/* Stage two, list-shaped types: the values themselves, ticked and
+            applied as they go. No operator control — "is any of" is the only
+            thing a list of values can mean, and "is not" lives in the typed
+            branch below. */}
+        {field && (multi || enumMulti) && column && (
+          <AnyRow
+            label={t('admin.components.table_toolbar.any_field', { field: column.label })}
+            active={!filters.some((f) => f.field === field)}
+            onSelect={clearValues}
+          />
+        )}
+
+        {field &&
+          enumMulti &&
+          listOptions.map((option) => (
+            <CheckRow
+              key={option.value}
+              checked={checked.includes(option.value)}
+              sole={checked.length === 1 && checked[0] === option.value}
+              onToggle={() => toggleValue(option.value)}
+              onOnly={() => setValues([option.value])}
+            >
+              <StatusDot status={option.value} />
+              <span className="truncate">{option.label}</span>
+            </CheckRow>
+          ))}
+
+        {/* Booleans and scope-backed enums answer one question, so one click
+            picks the answer and closes. */}
+        {field &&
+          listed &&
+          !multi &&
+          !enumMulti &&
+          listOptions.map((option) => (
+            <button
+              key={option.value}
+              type="button"
+              data-slot="filter-panel-item"
+              className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+              onClick={() => commit(option.value, 'eq')}
+            >
+              {/* Booleans get one too: their values carry the same
+                  green/red reading as any other state. */}
+              {(type === 'enum' || type === 'boolean') && <StatusDot status={option.value} />}
+              {option.label}
+            </button>
+          ))}
+
+        {/* Tags and resources: several values at once. Each tick applies
+            immediately and the list stays open, so narrowing to two sellers is
+            two clicks rather than two clicks and a confirmation — the table
+            behind the panel is already showing the result. */}
+        {field && multi && column && (
+          <InlineValueList
+            key={column.key}
+            column={column}
+            tenantId={tenantId}
+            query={query}
+            selected={checked}
+            onToggle={toggleValue}
+            onOnly={(option) => setValues([option])}
+          />
+        )}
+
+        {/* Stage two, dates: the presets and range calendar the quick filter
+            uses, so a range is picked the same way wherever it is set. */}
+        {field && dated && <ColumnDateRange field={field} filters={filters} onApply={onApply} />}
+
+        {/* Stage two, everything else: an operator and a value. The operator
+            lives here rather than in the header because it only exists for
+            these types — a text column's "contains" versus "starts with" is a
+            real choice, where a status has nothing to choose. */}
+        {field && !listed && !dated && (
+          <div data-slot="filter-panel-controls" className="flex flex-col gap-3 p-3">
+            <Select items={operators} value={operator} onValueChange={setOperator}>
+              {/* Default size, not `sm`: this sits directly above the value
+                  input, and `sm` pins a fixed 8 height while the input only
+                  has that as a floor and grows with the panel's 14px text —
+                  so the pair rendered at two different heights. */}
+              <SelectTrigger>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {operators.map((op) => (
+                  <SelectItem key={op.value} value={op.value}>
+                    {op.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+
+            {/* A quick-filtered enum still knows its values, so it picks from
+                them rather than asking for a slug typed from memory: this
+                branch is reached for `is not`, which the control cannot say,
+                not because the values became unknown. */}
+            {!noValueOperators.includes(operator) && listOptions.length > 0 ? (
+              <Select items={listOptions} value={value} onValueChange={setValue}>
+                <SelectTrigger>
+                  <SelectValue
+                    placeholder={t('admin.components.table_toolbar.filter_select_placeholder')}
+                  />
+                </SelectTrigger>
+                <SelectContent>
+                  {listOptions.map((option) => (
+                    <SelectItem key={option.value} value={option.value}>
+                      {option.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            ) : null}
+
+            {/* Everything picked from a list — currency, locale, tags, resources — or
+                from a calendar is handled above; this branch is only the types
+                you type into. */}
+            {!noValueOperators.includes(operator) && listOptions.length === 0 && (
+              <Input
+                type={type === 'number' ? 'number' : 'text'}
+                placeholder={t('admin.components.table_toolbar.filter_text_placeholder')}
+                value={value}
+                onChange={(event) => setValue(event.target.value)}
+                // Enter applies, so a text filter is type-and-go rather than
+                // type-then-reach-for-the-button.
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') {
+                    event.preventDefault()
+                    commit(value)
+                  }
+                }}
+              />
+            )}
+
+            {/* Right-aligned rather than stretched: a full-width black bar
+                reads as the panel's primary purpose, when it is one step in a
+                filter the operator is still composing. */}
+            <div className="flex justify-end">
+              <Button size="sm" onClick={() => commit(value)}>
+                {t('admin.actions.apply')}
+              </Button>
+            </div>
+          </div>
+        )}
+
+        {/* Nothing matched the search — say so rather than showing a blank
+            panel that reads as broken. */}
+        {((!field && visibleFields.length === 0) ||
+          (field && listed && !multi && listOptions.length === 0)) && (
+          <p className="px-2 py-6 text-center text-muted-foreground">
+            {t('admin.common.no_results')}
+          </p>
+        )}
+      </div>
+    </div>
+  )
+}

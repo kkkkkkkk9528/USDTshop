@@ -1,0 +1,26 @@
+import { ExportButton, type ResourceSearch, ResourceTable } from '@spree/dashboard-core'
+import { useRowClickBridge } from '@spree/dashboard-ui'
+import type { Order } from '@spree/seller-sdk'
+import { useNavigate, useParams } from '@tanstack/react-router'
+import { sellerClient } from '../api-client'
+import '../tables/orders'
+
+/** What this seller has sold, newest first. */
+export function OrdersPage({ search }: { search: ResourceSearch }) {
+  const { sellerId } = useParams({ from: '/_authenticated/$sellerId' })
+  const navigate = useNavigate()
+
+  useRowClickBridge('data-order-id', (orderId: string) =>
+    navigate({ to: '/$sellerId/orders/$orderId', params: { sellerId, orderId } }),
+  )
+
+  return (
+    <ResourceTable<Order>
+      tableKey="seller-orders"
+      queryKey="seller-orders"
+      queryFn={(params) => sellerClient().orders.list(params)}
+      searchParams={search}
+      actions={(ctx) => <ExportButton type="orders" {...ctx} />}
+    />
+  )
+}

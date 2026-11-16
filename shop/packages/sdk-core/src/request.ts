@@ -1,0 +1,361 @@
+import { randomUUID } from '@spree/core'
+import type { ErrorResponse, LocaleDefaults, ValidationErrorDetail } from './types'
+
+export interface RetryConfig {
+  /** Maximum number of retries (default: 2) */
+  maxRetries?: number
+  /** HTTP status codes to retry on (default: [429, 500, 502, 503, 504]) */
+  retryOnStatus?: number[]
+  /** Base delay in ms for exponential backoff (default: 300) */
+  baseDelay?: number
+  /** Maximum delay in ms (default: 10000) */
+  maxDelay?: number
+  /** Whether to retry on network errors (default: true) */
+  retryOnNetworkError?: boolean
+}
+
+export interface RequestOptions {
+  /** Bearer token for authenticated requests */
+  token?: string
+  /** Spree token for guest cart/checkout/order access */
+  spreeToken?: string
+  /** Locale for translated content (e.g., 'en', 'fr') */
+  locale?: string
+  /** Currency for prices (e.g., 'USD', 'EUR') */
+  currency?: string
+  /** Country ISO code for market resolution (e.g., 'US', 'DE') */
+  country?: string
+  /** Channel code (e.g., 'pos', 'wholesale') sent as X-Spree-Channel — selects which sales channel scopes the request */
+  channel?: string
+  /** Idempotency key for safe retries of mutating requests (max 255 characters) */
+  idempotencyKey?: string
+  /** Custom headers */
+  headers?: Record<string, string>
+}
+
+export interface InternalRequestOptions extends RequestOptions {
+  body?: unknown
+  params?: Record<string, string | number | boolean | (string | number)[] | undefined>
+}
+
+export class SpreeError extends Error {
+  public readonly code: string
+  public readonly status: number
+  public readonly details?: Record<string, string[] | ValidationErrorDetail[]>
+
+  constructor(response: ErrorResponse, status: number) {
+    super(response.error.message)
+    this.name = 'SpreeError'
+    this.code = response.error.code
+    this.status = status
+    this.details = response.error.details
+  }
+}
+
+export type RequestFn = <T>(
+  method: string,
+  path: string,
+  options?: InternalRequestOptions,
+) => Promise<T>
+
+function calculateDelay(attempt: number, config: Required<RetryConfig>): number {
+  const exponentialDelay = config.baseDelay * 2 ** attempt
+  const jitter = Math.random() * config.baseDelay
+  return Math.min(exponentialDelay + jitter, config.maxDelay)
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+function generateIdempotencyKey(): string {
+  return `spree-sdk-retry-${randomUUID()}`
+}
+
+function shouldRetryOnStatus(
+  method: string,
+  status: number,
+  config: Required<RetryConfig>,
+  hasIdempotencyKey: boolean,
+): boolean {
+  const isIdempotent = method === 'GET' || method === 'HEAD' || hasIdempotencyKey
+  if (isIdempotent) {
+    return config.retryOnStatus.includes(status)
+  }
+  return status === 429
+}
+
+function shouldRetryOnNetworkError(
+  method: string,
+  config: Required<RetryConfig>,
+  hasIdempotencyKey: boolean,
+): boolean {
+  if (!config.retryOnNetworkError) return false
+  return method === 'GET' || method === 'HEAD' || hasIdempotencyKey
+}
+
+export interface RequestConfig {
+  baseUrl: string
+  fetchFn: typeof fetch
+  retryConfig: Required<RetryConfig> | false
+  /**
+   * Credentials mode for cross-origin requests. Pass `'include'` for cookie-based auth.
+   * Defaults to fetch's built-in default (`'same-origin'` in browsers) when omitted.
+   */
+  credentials?: RequestCredentials
+  /**
+   * Called once per HTTP attempt, after it succeeds or fails. Bodies and
+   * headers are passed by reference, credentials included, so a listener that
+   * stores them must copy and redact first.
+   */
+  onRequestComplete?: (event: RequestCompleteEvent) => void
+}
+
+/** One finished HTTP attempt, as `onRequestComplete` receives it. */
+export interface RequestCompleteEvent {
+  method: string
+  /** Path including the API prefix, e.g. `/api/v3/admin/products`. */
+  path: string
+  query?: InternalRequestOptions['params']
+  /** The full URL requested, with the base and the serialised query. */
+  url: string
+  /** `null` when no response arrived (network error). */
+  status: number | null
+  durationMs: number
+  /** The `X-Request-Id` response header, for matching server logs. */
+  requestId: string | null
+  requestHeaders: Record<string, string>
+  requestBody: unknown
+  /** Parsed JSON, or `undefined` when the body was empty or not read. */
+  responseBody: unknown
+  error?: unknown
+}
+
+export interface AuthConfig {
+  headerName: string
+  headerValue: string
+}
+
+/**
+ * Creates a bound request function for a specific API scope (store or admin).
+ */
+export function createRequestFn(
+  config: RequestConfig,
+  basePath: string,
+  auth: AuthConfig,
+  defaults?: LocaleDefaults,
+): RequestFn {
+  return async function request<T>(
+    method: string,
+    path: string,
+    options: InternalRequestOptions = {},
+  ): Promise<T> {
+    const { token, spreeToken, idempotencyKey, headers = {}, body, params } = options
+
+    // Per-request options override client-level defaults
+    const locale = options.locale ?? defaults?.locale
+    const currency = options.currency ?? defaults?.currency
+    const country = options.country ?? defaults?.country
+    const channel = options.channel ?? defaults?.channel
+
+    // Build URL with query params.
+    // `new URL(path)` throws on a relative path. When baseUrl is empty (browser
+    // hitting a same-origin proxy like Vite dev), resolve against window.location.
+    const urlBase =
+      config.baseUrl || (typeof window !== 'undefined' ? window.location?.origin : undefined)
+    if (!urlBase) {
+      throw new TypeError(
+        'sdk-core: baseUrl is required in non-browser environments (no window.location to resolve relative URLs against)',
+      )
+    }
+    const url = new URL(`${config.baseUrl}${basePath}${path}`, urlBase)
+    if (params) {
+      Object.entries(params).forEach(([key, value]) => {
+        if (value !== undefined) {
+          if (Array.isArray(value)) {
+            for (const v of value) {
+              url.searchParams.append(key, String(v))
+            }
+          } else {
+            url.searchParams.set(key, String(value))
+          }
+        }
+      })
+    }
+    // A multipart body sets its own Content-Type, boundary included.
+    const isFormData = typeof FormData !== 'undefined' && body instanceof FormData
+
+    // Build headers
+    const requestHeaders: Record<string, string> = {
+      ...(isFormData ? {} : { 'Content-Type': 'application/json' }),
+      ...headers,
+    }
+
+    if (auth.headerName && auth.headerValue) {
+      requestHeaders[auth.headerName] = auth.headerValue
+    }
+
+    if (token) {
+      requestHeaders.Authorization = `Bearer ${token}`
+    }
+
+    if (spreeToken) {
+      requestHeaders['x-spree-token'] = spreeToken
+    }
+
+    if (locale) {
+      requestHeaders['x-spree-locale'] = locale
+    }
+
+    if (currency) {
+      requestHeaders['x-spree-currency'] = currency
+    }
+
+    if (country) {
+      requestHeaders['x-spree-country'] = country
+    }
+
+    if (channel) {
+      requestHeaders['x-spree-channel'] = channel
+    }
+
+    // Auto-generate idempotency key for mutating requests when retries are enabled (Stripe-style).
+    // User-supplied keys take precedence over auto-generated ones.
+    const isMutating = method !== 'GET' && method !== 'HEAD'
+    const effectiveIdempotencyKey =
+      idempotencyKey ?? (isMutating && config.retryConfig ? generateIdempotencyKey() : undefined)
+
+    if (effectiveIdempotencyKey) {
+      requestHeaders['Idempotency-Key'] = effectiveIdempotencyKey
+    }
+
+    const hasIdempotencyKey = !!effectiveIdempotencyKey
+    const maxAttempts = config.retryConfig ? config.retryConfig.maxRetries + 1 : 1
+
+    const onComplete = config.onRequestComplete
+    let startedAt = 0
+    const report = (response: Response | null, responseBody: unknown, error?: unknown) => {
+      if (!onComplete) return
+      try {
+        onComplete({
+          method,
+          path: `${basePath}${path}`,
+          query: params,
+          url: url.toString(),
+          status: response?.status ?? null,
+          durationMs: performance.now() - startedAt,
+          requestId: response?.headers.get('x-request-id') ?? null,
+          requestHeaders,
+          requestBody: body,
+          responseBody,
+          ...(error === undefined ? {} : { error }),
+        })
+      } catch {
+        // A broken listener must never fail the request it observes.
+      }
+    }
+    // Not awaited, so a body that fails to parse still rejects past the retry loop.
+    const reportBody = <R>(response: Response, parsed: Promise<R>): Promise<R> => {
+      if (!onComplete) return parsed
+      return parsed.then(
+        (data) => {
+          report(response, data)
+          return data
+        },
+        (error) => {
+          report(response, undefined, error)
+          throw error
+        },
+      )
+    }
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      if (onComplete) startedAt = performance.now()
+      try {
+        const response = await config.fetchFn(url.toString(), {
+          method,
+          headers: requestHeaders,
+          body: isFormData ? body : body ? JSON.stringify(body) : undefined,
+          credentials: config.credentials,
+        })
+
+        if (!response.ok) {
+          const isLastAttempt = attempt >= maxAttempts - 1
+
+          if (
+            !isLastAttempt &&
+            config.retryConfig &&
+            shouldRetryOnStatus(method, response.status, config.retryConfig, hasIdempotencyKey)
+          ) {
+            report(response, undefined)
+            const retryAfter = response.headers.get('Retry-After')
+            const delay = retryAfter
+              ? Math.min(parseInt(retryAfter, 10) * 1000, config.retryConfig.maxDelay)
+              : calculateDelay(attempt, config.retryConfig)
+            await sleep(delay)
+            continue
+          }
+
+          const errorBody: ErrorResponse | null = await response.json().catch(() => null)
+          // Proxy error pages and empty bodies must not turn HTTP failures into network retries.
+          const spreeError =
+            typeof errorBody?.error?.code === 'string' &&
+            typeof errorBody.error.message === 'string'
+              ? new SpreeError(errorBody, response.status)
+              : new SpreeError(
+                  {
+                    error: {
+                      code: 'http_error',
+                      message: `Request failed with status ${response.status}`,
+                    },
+                  },
+                  response.status,
+                )
+          report(response, errorBody ?? undefined, spreeError)
+          throw spreeError
+        }
+
+        // Handle 204 No Content (empty body)
+        if (response.status === 204) {
+          report(response, undefined)
+          return undefined as T
+        }
+
+        // Handle 202 Accepted — may or may not have a body
+        if (response.status === 202) {
+          const contentType = response.headers.get('content-type')
+          if (contentType?.includes('application/json')) {
+            return reportBody(response, response.json() as Promise<T>)
+          }
+          report(response, undefined)
+          return undefined as T
+        }
+
+        return reportBody(response, response.json() as Promise<T>)
+      } catch (error) {
+        if (error instanceof SpreeError) {
+          throw error
+        }
+
+        report(null, undefined, error)
+
+        const isLastAttempt = attempt >= maxAttempts - 1
+
+        if (
+          !isLastAttempt &&
+          config.retryConfig &&
+          shouldRetryOnNetworkError(method, config.retryConfig, hasIdempotencyKey)
+        ) {
+          const delay = calculateDelay(attempt, config.retryConfig)
+          await sleep(delay)
+          continue
+        }
+
+        throw error
+      }
+    }
+
+    // This should never be reached, but TypeScript needs it
+    throw new Error('Unexpected end of retry loop')
+  }
+}

@@ -1,0 +1,196 @@
+module Spree
+  module Checkout
+    # Built-in checkout requirements that map to the standard Spree checkout flow.
+    #
+    # Checks line items, email, shipping address, shipping method, and payment
+    # against the cart — checkout is a cart-phase concern. The heavier
+    # completion-only checks (per-item stock, discontinued products, guest
+    # policy) run only when +completion: true+ is passed, so the advisory
+    # requirements feed on cart reads stays cheap.
+    #
+    # @see Requirements
+    class DefaultRequirements
+      # Everything the discontinuation and stock checks read, so a set of
+      # lines is checked at once.
+      STOCK_CHECK_ASSOCIATIONS = {
+        variant: [{ product: %i[store product_publications] }, { stock_levels: %i[stock_location active_stock_reservations] }]
+      }.freeze
+
+      # @param cart [Spree::Cart]
+      def initialize(cart)
+        @cart = cart
+      end
+
+      # @param completion [Boolean] include the completion-only checks
+      # @return [Array<Hash{Symbol => String}>] unmet requirements as
+      #   +{ step:, field:, code:, message: }+ hashes
+      def call(completion: false)
+        requirements = advisory_requirements
+        return requirements unless completion
+
+        requirements + completion_requirements
+      end
+
+      private
+
+      def advisory_requirements
+        [].tap do |r|
+          r << req('cart', 'line_items', I18n.t('spree.checkout_requirements.line_items_required')) unless @cart.line_items.any?
+          r << req('address', 'email', I18n.t('spree.checkout_requirements.email_required')) unless @cart.email.present?
+          r << req('address', 'ship_address', I18n.t('spree.checkout_requirements.ship_address_required')) if @cart.shipping_address_required? && @cart.ship_address.blank?
+          r << req('delivery', 'delivery_method', I18n.t('spree.checkout_requirements.delivery_method_required')) if delivery_step_required? && !delivery_method_selected?
+          r.concat(undeliverable_errors)
+          r << req('payment', 'payment', I18n.t('spree.checkout_requirements.payment_required')) if payment_required? && !payment_satisfied?
+          r << req('address', 'po_number', I18n.t('spree.checkout_requirements.po_number_required')) if po_number_missing?
+          r << order_minimum_requirement if below_order_minimum?
+        end
+      end
+
+      def completion_requirements
+        errors = stock_errors + quantity_rule_errors + assortment_errors
+        errors << req('address', 'email', I18n.t('spree.guest_checkout_not_allowed'), code: 'guest_checkout_not_allowed') if @cart.guest_checkout_disallowed?
+        errors
+      end
+
+      # Re-checked at completion because an agreement can change between the
+      # add and the checkout — a company moved to a different tier, a term
+      # edited. Naming the nearest valid quantities rather than rounding: a
+      # silent adjustment on a wholesale order is a five-figure surprise.
+      def quantity_rule_errors
+        @cart.quantity_rule_violations.map do |_line_item, message|
+          req('cart', 'line_items', message, code: 'quantity_rule_violated')
+        end
+      end
+
+      # Re-checked at completion because a line can outlive the add that
+      # admitted it: a guest cart claimed after sign-in, a cart moved to
+      # another company, an assortment edited since. An order arriving here is
+      # staff's draft, which may sell outside the buyer's catalogs. A
+      # discontinued line already has its own requirement.
+      def assortment_errors
+        return [] unless @cart.is_a?(Spree::Cart)
+
+        line_items = completion_line_items.reject { |line_item| discontinued?(line_item) }
+        orderable_ids = @cart.orderable_variants.where(id: line_items.map(&:variant_id)).pluck(:id).to_set
+
+        line_items.reject { |line_item| orderable_ids.include?(line_item.variant_id) }.map do |line_item|
+          req('cart', 'line_items', I18n.t('spree.cart_line_item.not_orderable', li_name: line_item.name), code: 'not_orderable')
+        end
+      end
+
+      # Advisory rather than completion-only: a buyer has to be able to build
+      # the order below the threshold and read how far off they are while
+      # they can still add to it. Completion refuses it because the advisory
+      # feed is included there too.
+      def below_order_minimum?
+        !@cart.staff_initiated? && @cart.below_order_minimum?
+      end
+
+      def order_minimum_requirement
+        minimum = @cart.order_minimum
+        shortfall = Spree::Money.new(@cart.order_minimum_shortfall, currency: minimum.currency)
+
+        req('cart', 'order_minimum',
+            I18n.t('spree.checkout_requirements.order_minimum_not_met',
+                    minimum: minimum.display_amount.to_s, shortfall: shortfall.to_s),
+            code: 'order_minimum_not_met')
+      end
+
+      # Discontinuation is checked at both levels: a product can stay active
+      # while an individual variant hit its discontinue_on date after it
+      # entered the cart.
+      def stock_errors
+        completion_line_items.filter_map do |line_item|
+          if discontinued?(line_item)
+            req('cart', 'line_items', I18n.t('spree.cart_line_item.discontinued', li_name: line_item.name), code: 'discontinued')
+          elsif !line_item.sufficient_stock?
+            req('cart', 'line_items', I18n.t('spree.cart_line_item.out_of_stock', li_name: line_item.name), code: 'out_of_stock')
+          end
+        end
+      end
+
+      # A rebuild drops a proposal no method can quote with only a transient
+      # warning, so part of a line can be in no fulfillment. Advisory, so the
+      # buyer reads it while they can still change the address or the cart.
+      def undeliverable_errors
+        return [] unless delivery_step_required? && @cart.fulfillments.any?
+
+        undelivered_line_items.map do |line_item|
+          req('delivery', 'line_items', I18n.t('spree.cart_line_item.delivery_unavailable', li_name: line_item.name),
+              code: 'delivery_unavailable')
+        end
+      end
+
+      # A line short of stock is packed short too; the stock check already
+      # names it. Only lines short of a fulfillment pay for that check, so a
+      # cart read stays at one query.
+      def undelivered_line_items
+        allocated = Spree::FulfillmentItem.where(fulfillment_id: @cart.fulfillments.select(:id))
+                                          .group(:line_item_id).sum(:quantity)
+        short = @cart.line_items.select { |line_item| allocated.fetch(line_item.id, 0) < line_item.quantity }
+        return [] if short.empty?
+
+        ActiveRecord::Associations::Preloader.new(records: short, associations: STOCK_CHECK_ASSOCIATIONS).call
+        short.reject { |line_item| discontinued?(line_item) || !line_item.sufficient_stock? }
+      end
+
+      def discontinued?(line_item)
+        line_item.variant.nil? || line_item.variant.discontinued? || line_item.variant.product.discontinued?
+      end
+
+      def completion_line_items
+        @completion_line_items ||= @cart.line_items.includes(STOCK_CHECK_ASSOCIATIONS).to_a
+      end
+
+      def delivery_step_required?
+        @cart.delivery_step_required?
+      end
+
+      def delivery_method_selected?
+        @cart.fulfillments.any? && @cart.fulfillments.all? { |fulfillment| fulfillment.delivery_method.present? }
+      end
+
+      def payment_required?
+        @cart.payment_required?
+      end
+
+      # What checkout has to collect, which is the whole total unless an
+      # arrangement collects only part of it up front.
+      def payment_satisfied?
+        paid = if @cart.read_association_in_memory?(:payments)
+                 @cart.payments.reject(&:has_invalid_status?).sum(BigDecimal('0'), &:amount)
+               else
+                 @cart.payments.valid.sum(:amount)
+               end
+
+        paid >= @cart.amount_due_at_checkout
+      end
+
+      # Advisory rather than completion-only: the buyer has to be told the
+      # reference is needed while they can still type it, not refused at the
+      # end of checkout. Staff keying an order in are exempt — the buyer's PO
+      # commonly arrives with the paperwork rather than at the till.
+      #
+      # Reported against `address` rather than `payment`: payment is dropped
+      # from the steps of a cart that owes nothing, and a requirement naming a
+      # step the buyer never visits is one they cannot clear.
+      def po_number_missing?
+        @cart.po_number.blank? && @cart.po_number_required? && !keyed_in_by_staff?
+      end
+
+      # Narrower than {Spree::Purchase::QuantityRules#staff_initiated?} on
+      # purpose. A buyer's PO reference commonly arrives with the paperwork,
+      # so only an order someone actually keyed in is excused — a draft with
+      # no recorded creator still has to ask for it. Quantity terms take the
+      # wider exemption: any draft order is the admin surface, and refusing
+      # staff there would make an agreed exception impossible to record.
+      def keyed_in_by_staff?
+        @cart.respond_to?(:created_by_id) && @cart.created_by_id.present?
+      end
+
+      def req(step, field, message, code: nil)
+        { step: step, field: field, code: code || "#{field}_required", message: message }
+      end
+    end
+  end
+end

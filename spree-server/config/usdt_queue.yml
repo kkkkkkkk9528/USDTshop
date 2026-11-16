@@ -1,0 +1,27 @@
+# Dedicated, minimal Solid Queue supervisor for USDT deposit verification.
+# It only listens on `usdt_deposits`, so it cannot steal work from the main
+# Puma-hosted worker (and that older worker, forked before these classes
+# existed, cannot resolve the new job class).
+#
+# Started with:
+#   SOLID_QUEUE_CONFIG=config/usdt_queue.yml bundle exec bin/jobs
+#
+# The recurring schedule in config/recurring.yml adds a scheduler process
+# automatically. Once Puma is restarted, its own worker also picks up the
+# usdt_deposits queue (listed in config/queue.yml) and this extra supervisor
+# is no longer required.
+development:
+  workers:
+    - queues:
+        - usdt_deposits
+      threads: 1
+      processes: 1
+      polling_interval: 0.5
+
+production:
+  workers:
+    - queues:
+        - usdt_deposits
+      threads: 1
+      processes: 1
+      polling_interval: 0.5

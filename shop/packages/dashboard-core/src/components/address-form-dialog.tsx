@@ -1,0 +1,570 @@
+import { zodResolver } from '@hookform/resolvers/zod'
+import { type CountryCode, isCountryCode } from '@spree/core'
+import {
+  Button,
+  Checkbox,
+  Field,
+  FieldDescription,
+  FieldError,
+  FieldGroup,
+  FieldLabel,
+  Input,
+  requiredMessage,
+  Sheet,
+  SheetContent,
+  SheetDescription,
+  SheetFooter,
+  SheetHeader,
+  SheetTitle,
+  useConfirm,
+} from '@spree/dashboard-ui'
+import { useEffect, useRef } from 'react'
+import { Controller, type DefaultValues, useForm } from 'react-hook-form'
+import { useTranslation } from 'react-i18next'
+import { z } from 'zod/v4'
+import { mapSpreeErrorsToForm } from '../lib/form-errors'
+import { countryCodeSchema } from '../lib/iso-codes'
+import { useOptionalStore } from '../providers/store-provider'
+import { CountryCombobox } from './country-combobox'
+import { StateCombobox, useCountryStates } from './country-state-fields'
+
+export interface AddressParams {
+  first_name: string
+  last_name: string
+  company?: string
+  address1: string
+  address2: string
+  city: string
+  postal_code: string
+  country_code: CountryCode
+  state_code: string
+  phone: string
+  label?: string
+  is_default_billing?: boolean
+  is_default_shipping?: boolean
+}
+
+const addressFormFields = {
+  address1: z
+    .string()
+    .trim()
+    .min(1, { error: requiredMessage('address.address1') }),
+  address2: z.string(),
+  city: z
+    .string()
+    .trim()
+    .min(1, { error: requiredMessage('city') }),
+  postal_code: z.string(),
+  country_code: countryCodeSchema,
+  state_code: z.string(),
+  phone: z.string(),
+  label: z.string(),
+  is_default_billing: z.boolean(),
+  is_default_shipping: z.boolean(),
+}
+
+/**
+ * Whose address this is.
+ *
+ * A person's address is addressed to them, so it needs their name. A
+ * business's is addressed to the company — there is no person to name, and
+ * the company is the part that cannot be left out. Mirrors the same
+ * distinction `Spree::Address` makes server-side, so the form asks for
+ * exactly what the model will accept.
+ */
+const personalSchema = z.object({
+  ...addressFormFields,
+  first_name: z
+    .string()
+    .trim()
+    .min(1, { error: requiredMessage('first_name') }),
+  last_name: z
+    .string()
+    .trim()
+    .min(1, { error: requiredMessage('last_name') }),
+  company: z.string(),
+})
+
+const businessSchema = z.object({
+  ...addressFormFields,
+  first_name: z.string(),
+  last_name: z.string(),
+  company: z
+    .string()
+    .trim()
+    .min(1, { error: requiredMessage('company') }),
+})
+
+type AddressFormValues = z.infer<typeof personalSchema>
+
+/**
+ * The fields whose requirement depends on the chosen country. Checked in the
+ * schema rather than on submit, so they report alongside every other missing
+ * field instead of on a second attempt.
+ */
+function withCountryRules(
+  schema: typeof personalSchema | typeof businessSchema,
+  rules: { statesRequired: boolean; postalCodeRequired: boolean },
+) {
+  return schema.superRefine((values, ctx) => {
+    if (rules.statesRequired && !values.state_code.trim()) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['state_code'],
+        message: requiredMessage('state_code')(),
+      })
+    }
+    if (rules.postalCodeRequired && !values.postal_code.trim()) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['postal_code'],
+        message: requiredMessage('address.postal_code')(),
+      })
+    }
+  })
+}
+
+/** Address rows validate on `state`; every address form binds `state_code`. */
+const ADDRESS_SERVER_FIELD_ALIASES = { state: 'state_code' } as const satisfies Partial<
+  Record<string, keyof AddressFormValues>
+>
+
+/**
+ * Just the fields this dialog reads.
+ *
+ * Structural rather than the Admin SDK's `Address`, which carries operator
+ * data (metadata, customer_id, timestamps) that a seller's serializer
+ * deliberately withholds — binding core to the wider type would stop the
+ * seller panel from reusing the one address form.
+ */
+export interface EditableAddress {
+  /** Re-seeds the form when the dialog is pointed at a different address. */
+  id?: string
+  first_name?: string | null
+  last_name?: string | null
+  company?: string | null
+  address1?: string | null
+  address2?: string | null
+  city?: string | null
+  postal_code?: string | null
+  country_code?: string | null
+  state_code?: string | null
+  phone?: string | null
+  label?: string | null
+  is_default_billing?: boolean | null
+  is_default_shipping?: boolean | null
+}
+
+/**
+ * Country a new address starts with. An existing record keeps whatever it
+ * stored; a new one takes the store's default so the merchant is not asked
+ * to pick the same country every time.
+ */
+export function resolveAddressCountryCode(
+  address: EditableAddress | null | undefined,
+  storeDefaultCountryCode?: string | null,
+): CountryCode | undefined {
+  const countryCode = address?.country_code || storeDefaultCountryCode
+  return isCountryCode(countryCode) ? countryCode : undefined
+}
+
+function buildDefaults(
+  address: EditableAddress | null | undefined,
+  storeDefaultCountryCode?: string | null,
+): DefaultValues<AddressFormValues> {
+  return {
+    first_name: address?.first_name ?? '',
+    last_name: address?.last_name ?? '',
+    company: address?.company ?? '',
+    address1: address?.address1 ?? '',
+    address2: address?.address2 ?? '',
+    city: address?.city ?? '',
+    postal_code: address?.postal_code ?? '',
+    country_code: resolveAddressCountryCode(address, storeDefaultCountryCode),
+    state_code: address?.state_code ?? '',
+    phone: address?.phone ?? '',
+    label: address?.label ?? '',
+    is_default_billing: address?.is_default_billing ?? false,
+    is_default_shipping: address?.is_default_shipping ?? false,
+  }
+}
+
+export function AddressFormDialog({
+  address,
+  open,
+  onOpenChange,
+  onSave,
+  title,
+  isPending = false,
+  showLabel = false,
+  showDefaultFlags = false,
+  business = false,
+  companyReadOnly = false,
+  description,
+}: {
+  address: EditableAddress | null | undefined
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  onSave: (address: AddressParams) => void | Promise<void>
+  title?: string
+  isPending?: boolean
+  showLabel?: boolean
+  showDefaultFlags?: boolean
+  /** Addressed to a company rather than a person — see the schemas above. */
+  business?: boolean
+  /**
+   * Show the company line but do not let it be edited. For an address whose
+   * owner already answers the question — a company node names itself, so
+   * there is nothing for the merchant to type.
+   */
+  companyReadOnly?: boolean
+  /** Overrides the standard "update the address details" blurb. */
+  description?: string
+}) {
+  const { t } = useTranslation()
+  const resolvedTitle = title ?? t('admin.components.address_form_dialog.edit_title')
+  // Optional: the seller panel has no store context, so a new address there
+  // stays country-empty rather than refusing to render.
+  const storeContext = useOptionalStore()
+  const storeDefaultCountryCode = storeContext?.defaultCountry
+  // Left unmarked rather than marked optional when the store asks for a
+  // phone: a stock location never requires one, so "required" would be wrong
+  // there.
+  const phoneOptional = !storeContext?.store?.address_requires_phone
+  const form = useForm<AddressFormValues>({
+    defaultValues: buildDefaults(address, storeDefaultCountryCode),
+    resolver: (values, context, options) =>
+      zodResolver(
+        withCountryRules(business ? businessSchema : personalSchema, countryRules.current),
+      )(values, context, options),
+  })
+  const { errors, isDirty } = form.formState
+  const confirm = useConfirm()
+  // Saving a filled-in address waits for a change. A blank one stays
+  // saveable, so pressing Save shows what is still missing.
+  const saveNeedsChange = Boolean(address?.address1)
+
+  // Closing with an edit asks first, whichever way the sheet is closed.
+  async function requestClose() {
+    if (isDirty && !isPending) {
+      const ok = await confirm({
+        title: t('admin.actions.discard_changes'),
+        message: t('admin.common.unsaved_changes'),
+        variant: 'destructive',
+        confirmLabel: t('admin.actions.discard'),
+      })
+      if (!ok) return
+    }
+    onOpenChange(false)
+  }
+
+  const countryCode = form.watch('country_code')
+  const { states, statesRequired, postalCodeRequired } = useCountryStates(countryCode)
+  const countryRules = useRef({ statesRequired, postalCodeRequired })
+  countryRules.current = { statesRequired, postalCodeRequired }
+
+  // The parent keys the dialog on the address id so a fresh instance mounts
+  // for each open, but `address` can also stream in async (loaded after the
+  // sheet mounts). Reset only when the *record identity* changes — otherwise a
+  // re-render that creates a new `address` object literal would clobber edits
+  // mid-flow.
+  const prevAddressIdRef = useRef<string | null | undefined>(address?.id)
+  useEffect(() => {
+    if (address?.id !== prevAddressIdRef.current) {
+      prevAddressIdRef.current = address?.id
+      form.reset(buildDefaults(address, storeDefaultCountryCode))
+    }
+  }, [address, form, storeDefaultCountryCode])
+
+  // The store payload can arrive after the sheet mounts. Fill country on a
+  // new record only while the field is still empty so a merchant who already
+  // picked a different country is not overwritten.
+  useEffect(() => {
+    if (address?.country_code) return
+    if (!isCountryCode(storeDefaultCountryCode)) return
+    if (form.getValues('country_code')) return
+    form.setValue('country_code', storeDefaultCountryCode)
+  }, [address?.country_code, storeDefaultCountryCode, form])
+
+  // Show the dropdown whenever the country enumerates subdivisions, not only
+  // when it strictly requires one — so a country like Pakistan still lets the
+  // user pick a province instead of typing a name that may not match.
+  const useStateCombobox = states.length > 0
+
+  async function onSubmit(values: AddressFormValues) {
+    try {
+      await onSave({
+        first_name: values.first_name,
+        last_name: values.last_name,
+        company: values.company,
+        address1: values.address1,
+        address2: values.address2,
+        city: values.city,
+        postal_code: values.postal_code,
+        country_code: values.country_code,
+        state_code: values.state_code,
+        phone: values.phone,
+        ...(showLabel && { label: values.label || undefined }),
+        ...(showDefaultFlags && {
+          is_default_billing: values.is_default_billing,
+          is_default_shipping: values.is_default_shipping,
+        }),
+      })
+    } catch (err) {
+      // Surface server-side 422 validation errors on the matching fields so
+      // the dialog reflects whatever the API rejected (e.g. "phone is too
+      // short"). Non-validation errors bubble to the parent's toast.
+      if (!mapSpreeErrorsToForm(err, form.setError, { fieldAliases: ADDRESS_SERVER_FIELD_ALIASES }))
+        throw err
+    }
+  }
+
+  // Prevent Enter in combobox inputs from submitting the form. RHF's
+  // handleSubmit fires on submit events, so swallow Enter inside any
+  // role=combobox before it bubbles into the form.
+  function handleKeyDown(e: React.KeyboardEvent) {
+    const target = e.target as HTMLElement
+    if (e.key === 'Enter' && target.getAttribute('role') === 'combobox') {
+      e.preventDefault()
+    }
+  }
+
+  return (
+    <Sheet open={open} onOpenChange={(o) => (o ? onOpenChange(true) : requestClose())}>
+      <SheetContent side="right">
+        <SheetHeader>
+          <SheetTitle>{resolvedTitle}</SheetTitle>
+          <SheetDescription>
+            {description ?? t('admin.components.address_form_dialog.description')}
+          </SheetDescription>
+        </SheetHeader>
+        <form
+          onSubmit={form.handleSubmit(onSubmit)}
+          onKeyDown={handleKeyDown}
+          className="flex flex-col flex-1 overflow-hidden"
+        >
+          <div className="flex-1 overflow-y-auto p-4">
+            {errors.root?.message && (
+              <p className="mb-4 text-base text-destructive" role="alert">
+                {errors.root.message}
+              </p>
+            )}
+            <FieldGroup>
+              {showLabel && (
+                <Field>
+                  <FieldLabel htmlFor="addr-label" optional>
+                    {t('admin.fields.address.label.label')}
+                  </FieldLabel>
+                  <Input
+                    id="addr-label"
+                    placeholder={t('admin.fields.address.label.placeholder')}
+                    {...form.register('label')}
+                  />
+                </Field>
+              )}
+              {business ? (
+                <Field>
+                  <FieldLabel htmlFor="addr-co">{t('admin.fields.company.label')}</FieldLabel>
+                  <Input
+                    id="addr-co"
+                    aria-invalid={!!errors.company || undefined}
+                    disabled={companyReadOnly}
+                    readOnly={companyReadOnly}
+                    {...form.register('company')}
+                  />
+                  {companyReadOnly && (
+                    <FieldDescription>{t('admin.fields.company.help')}</FieldDescription>
+                  )}
+                  <FieldError errors={[errors.company]} />
+                </Field>
+              ) : (
+                <div className="grid grid-cols-2 gap-3">
+                  <Field>
+                    <FieldLabel htmlFor="addr-fn">{t('admin.fields.first_name.label')}</FieldLabel>
+                    <Input
+                      id="addr-fn"
+                      aria-invalid={!!errors.first_name || undefined}
+                      {...form.register('first_name')}
+                    />
+                    <FieldError errors={[errors.first_name]} />
+                  </Field>
+                  <Field>
+                    <FieldLabel htmlFor="addr-ln">{t('admin.fields.last_name.label')}</FieldLabel>
+                    <Input
+                      id="addr-ln"
+                      aria-invalid={!!errors.last_name || undefined}
+                      {...form.register('last_name')}
+                    />
+                    <FieldError errors={[errors.last_name]} />
+                  </Field>
+                </div>
+              )}
+              <Field>
+                <FieldLabel htmlFor="addr-a1">
+                  {t('admin.fields.address.address1.label')}
+                </FieldLabel>
+                <Input
+                  id="addr-a1"
+                  aria-invalid={!!errors.address1 || undefined}
+                  {...form.register('address1')}
+                />
+                <FieldError errors={[errors.address1]} />
+              </Field>
+              <Field>
+                <FieldLabel htmlFor="addr-a2" optional>
+                  {t('admin.fields.address.address2.label')}
+                </FieldLabel>
+                <Input
+                  id="addr-a2"
+                  aria-invalid={!!errors.address2 || undefined}
+                  {...form.register('address2')}
+                />
+                <FieldError errors={[errors.address2]} />
+              </Field>
+              <Field>
+                <FieldLabel htmlFor="addr-country">
+                  {t('admin.fields.country_code.label')}
+                </FieldLabel>
+                <Controller
+                  name="country_code"
+                  control={form.control}
+                  render={({ field }) => (
+                    <CountryCombobox
+                      id="addr-country"
+                      invalid={!!errors.country_code}
+                      value={field.value}
+                      onBlur={field.onBlur}
+                      onValueChange={(iso) => {
+                        field.onChange(iso)
+                        form.setValue('state_code', '', { shouldDirty: true })
+                      }}
+                    />
+                  )}
+                />
+                <FieldError errors={[errors.country_code]} />
+              </Field>
+              <div className="grid grid-cols-2 gap-3">
+                <Field>
+                  <FieldLabel htmlFor="addr-city">{t('admin.fields.city.label')}</FieldLabel>
+                  <Input
+                    id="addr-city"
+                    aria-invalid={!!errors.city || undefined}
+                    {...form.register('city')}
+                  />
+                  <FieldError errors={[errors.city]} />
+                </Field>
+                {useStateCombobox ? (
+                  <Field>
+                    <FieldLabel htmlFor="addr-state" optional={!statesRequired}>
+                      {t('admin.fields.state_code.label')}
+                    </FieldLabel>
+                    <Controller
+                      name="state_code"
+                      control={form.control}
+                      render={({ field }) => (
+                        <StateCombobox
+                          id="addr-state"
+                          invalid={!!errors.state_code}
+                          countryCode={countryCode}
+                          states={states}
+                          value={field.value}
+                          onBlur={field.onBlur}
+                          onValueChange={field.onChange}
+                        />
+                      )}
+                    />
+                    <FieldError errors={[errors.state_code]} />
+                  </Field>
+                ) : (
+                  <Field>
+                    <FieldLabel htmlFor="addr-state-abbr" optional={!statesRequired}>
+                      {t('admin.fields.state_code.label')}
+                    </FieldLabel>
+                    <Input
+                      id="addr-state-abbr"
+                      aria-invalid={!!errors.state_code || undefined}
+                      {...form.register('state_code')}
+                    />
+                    <FieldError errors={[errors.state_code]} />
+                  </Field>
+                )}
+              </div>
+              <Field>
+                <FieldLabel htmlFor="addr-zip" optional={!postalCodeRequired}>
+                  {t('admin.fields.address.postal_code.label')}
+                </FieldLabel>
+                <Input
+                  id="addr-zip"
+                  aria-invalid={!!errors.postal_code || undefined}
+                  {...form.register('postal_code')}
+                />
+                <FieldError errors={[errors.postal_code]} />
+              </Field>
+              <Field>
+                <FieldLabel htmlFor="addr-phone" optional={phoneOptional}>
+                  {t('admin.fields.phone.label')}
+                </FieldLabel>
+                <Input
+                  id="addr-phone"
+                  aria-invalid={!!errors.phone || undefined}
+                  {...form.register('phone')}
+                />
+                <FieldError errors={[errors.phone]} />
+              </Field>
+              {showDefaultFlags && (
+                <>
+                  <Field>
+                    <Controller
+                      name="is_default_billing"
+                      control={form.control}
+                      render={({ field }) => (
+                        <label
+                          htmlFor="addr-default-billing"
+                          className="flex cursor-pointer items-center gap-2 text-base"
+                        >
+                          <Checkbox
+                            id="addr-default-billing"
+                            checked={!!field.value}
+                            onCheckedChange={field.onChange}
+                          />
+                          {t('admin.fields.address.is_default_billing.label')}
+                        </label>
+                      )}
+                    />
+                  </Field>
+                  <Field>
+                    <Controller
+                      name="is_default_shipping"
+                      control={form.control}
+                      render={({ field }) => (
+                        <label
+                          htmlFor="addr-default-shipping"
+                          className="flex cursor-pointer items-center gap-2 text-base"
+                        >
+                          <Checkbox
+                            id="addr-default-shipping"
+                            checked={!!field.value}
+                            onCheckedChange={field.onChange}
+                          />
+                          {t('admin.fields.address.is_default_shipping.label')}
+                        </label>
+                      )}
+                    />
+                  </Field>
+                </>
+              )}
+            </FieldGroup>
+          </div>
+          <SheetFooter>
+            <Button type="button" variant="outline" onClick={requestClose}>
+              {t('admin.actions.cancel')}
+            </Button>
+            <Button type="submit" disabled={isPending || (saveNeedsChange && !isDirty)}>
+              {isPending ? t('admin.actions.saving') : t('admin.actions.save')}
+            </Button>
+          </SheetFooter>
+        </form>
+      </SheetContent>
+    </Sheet>
+  )
+}

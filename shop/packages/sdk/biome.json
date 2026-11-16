@@ -1,0 +1,16 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.6.6/schema.json",
+  "root": false,
+  "extends": ["../../biome.json"],
+  "files": {
+    "includes": [
+      "src/**",
+      "tests/**",
+      "!src/types/generated",
+      "!src/types/filters.generated.ts",
+      "!src/types/params",
+      "!src/zod/generated",
+      "!src/webhooks/generated"
+    ]
+  }
+}

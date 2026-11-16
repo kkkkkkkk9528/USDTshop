@@ -1,0 +1,113 @@
+{
+  "name": "@spree/dashboard",
+  "license": "MIT",
+  "version": "6.0.4",
+  "description": "Spree Dashboard app shell — the next-gen React admin for Spree Commerce. Routes, resource hooks, schemas, locales, and the <Dashboard /> component. Source-only package; hosts compile it via @spree/dashboard/vite.",
+  "author": "Vendo Connect Inc.",
+  "homepage": "https://spreecommerce.org",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/spree/spree.git",
+    "directory": "packages/dashboard"
+  },
+  "keywords": [
+    "spree",
+    "commerce",
+    "ecommerce",
+    "admin",
+    "dashboard",
+    "react"
+  ],
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./styles.css": "./src/styles.css",
+    "./vite": {
+      "types": "./src/vite/index.ts",
+      "default": "./dist/vite-plugin/index.js"
+    },
+    "./vite/route-collisions": {
+      "types": "./src/vite/route-collisions.ts",
+      "default": "./dist/vite-plugin/route-collisions.js"
+    },
+    "./components/spree/payment-method-editors/types": "./src/components/spree/payment-method-editors/types.ts",
+    "./components/spree/auth-shell": "./src/components/spree/auth-shell.tsx",
+    "./components/spree/store-setup-fields": "./src/components/spree/store-setup-fields.tsx",
+    "./hooks/use-auth-providers": "./src/hooks/use-auth-providers.ts",
+    "./schemas/auth": "./src/schemas/auth.ts",
+    "./orders": "./src/orders.ts"
+  },
+  "files": [
+    "src",
+    "dist/vite-plugin",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build && tsup",
+    "lint": "biome check .",
+    "lint:fix": "biome check --fix .",
+    "format": "biome format --write .",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:e2e": "playwright test",
+    "test:e2e:ui": "playwright test --ui",
+    "test:e2e:first-run": "playwright test -c playwright.first-run.config.ts",
+    "test:e2e:install": "playwright install chromium",
+    "prepublishOnly": "tsup"
+  },
+  "dependencies": {
+    "@dnd-kit/core": "catalog:",
+    "@dnd-kit/sortable": "catalog:",
+    "@dnd-kit/utilities": "catalog:",
+    "@hookform/resolvers": "catalog:",
+    "@spree/core": "workspace:^",
+    "@tanstack/router-plugin": "catalog:",
+    "@tanstack/virtual-file-routes": "catalog:",
+    "date-fns": "catalog:",
+    "date-fns-tz": "catalog:",
+    "dompurify": "^3.4.17",
+    "lucide-react": "catalog:",
+    "recharts": "catalog:",
+    "zod": "catalog:"
+  },
+  "devDependencies": {
+    "@playwright/test": "catalog:",
+    "@spree/admin-sdk": "workspace:^",
+    "@spree/dashboard-core": "workspace:^",
+    "@spree/dashboard-plugin-example": "workspace:^",
+    "@spree/dashboard-ui": "workspace:^",
+    "@tanstack/react-query": "catalog:",
+    "@tanstack/react-router": "catalog:",
+    "@types/node": "catalog:",
+    "@types/react": "catalog:",
+    "@types/react-dom": "catalog:",
+    "@typescript/typescript6": "catalog:",
+    "@vitejs/plugin-react": "catalog:",
+    "i18next": "catalog:",
+    "react": "catalog:",
+    "react-dom": "catalog:",
+    "react-hook-form": "catalog:",
+    "react-i18next": "catalog:",
+    "shadcn": "catalog:",
+    "tailwindcss": "catalog:",
+    "tsup": "catalog:",
+    "typescript": "catalog:",
+    "vite": "catalog:",
+    "vitest": "catalog:"
+  },
+  "peerDependencies": {
+    "@spree/admin-sdk": "workspace:^",
+    "@spree/dashboard-core": "workspace:^",
+    "@spree/dashboard-ui": "workspace:^",
+    "@tanstack/react-query": "^5.104.5",
+    "@tanstack/react-router": "^1.170.46",
+    "i18next": "^26.5.3 || ^27.0.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "react-hook-form": "^7.90.0",
+    "react-i18next": "^17.1.0 || ^18.0.0"
+  }
+}

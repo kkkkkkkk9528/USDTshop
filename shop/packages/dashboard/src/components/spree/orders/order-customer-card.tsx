@@ -1,0 +1,177 @@
+import type { Order } from '@spree/admin-sdk'
+import { AddressFormDialog, type AddressParams, adminClient, useStore } from '@spree/dashboard-core'
+import {
+  AddressBlock,
+  Button,
+  Card,
+  CardAction,
+  CardContent,
+  CardHeader,
+  CardTitle,
+  toastManager,
+} from '@spree/dashboard-ui'
+import { CopyIcon, PencilIcon } from '@spree/dashboard-ui/icons'
+import { Link } from '@tanstack/react-router'
+import { useState } from 'react'
+import { useTranslation } from 'react-i18next'
+import { useOrderMutation } from '../../../hooks/use-order'
+import { customerDisplayName, erasedFieldValue } from '../../../lib/erased-customer'
+import { OrderCustomerForm } from './order-customer-form'
+
+type AddressType = 'shipping_address' | 'billing_address'
+
+/**
+ * Who the order is for and where it is going. The only place a placed order's
+ * addresses can be changed, so each save writes straight through rather than
+ * waiting for a page-level submit.
+ */
+export function CustomerCard({ order }: { order: Order }) {
+  const { t } = useTranslation()
+  const { storeId } = useStore()
+  const orderId = order.id
+  const customer = order.customer
+  const shippingAddress = order.shipping_address
+  const billingSameAsShipping = order.shipping_eq_billing_address
+  const [editAddress, setEditAddress] = useState<AddressType | null>(null)
+  const [editCustomer, setEditCustomer] = useState(false)
+
+  const showError = (error: unknown) =>
+    toastManager.add({
+      type: 'error',
+      title:
+        error instanceof Error ? error.message : t('admin.orders.errors.failed_to_update_address'),
+    })
+
+  const addressMutation = useOrderMutation(
+    orderId,
+    (params: { type: AddressType; address: AddressParams }) =>
+      adminClient.orders.update(orderId, { [params.type]: params.address }),
+  )
+  const sameAsShippingMutation = useOrderMutation(orderId, () =>
+    adminClient.orders.update(orderId, { use_shipping: true }),
+  )
+
+  const addressHeading = (type: AddressType, label: string) => (
+    <div className="flex items-center justify-between gap-2">
+      <h3 className="text-base font-medium">{label}</h3>
+      <Button
+        variant="ghost"
+        size="icon-sm"
+        onClick={() => setEditAddress(type)}
+        aria-label={
+          type === 'shipping_address'
+            ? t('admin.orders.detail.address_edit.shipping_title')
+            : t('admin.orders.detail.address_edit.billing_title')
+        }
+      >
+        <PencilIcon className="size-4" />
+      </Button>
+    </div>
+  )
+
+  // One card: the customer and both addresses read as one answer to "who is
+  // this for", and a missing address no longer costs a whole card.
+  return (
+    <>
+      <Card>
+        <CardHeader>
+          <CardTitle>{t('admin.pages.orders.detail.section_customer')}</CardTitle>
+          <CardAction>
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              onClick={() => setEditCustomer((editing) => !editing)}
+              aria-label={t('admin.orders.detail.customer_edit.title')}
+            >
+              <PencilIcon className="size-4" />
+            </Button>
+          </CardAction>
+        </CardHeader>
+        <CardContent className="flex flex-col divide-y text-base [&>section]:py-3 [&>section:first-child]:pt-0 [&>section:last-child]:pb-0">
+          <section className="flex flex-col gap-1">
+            {editCustomer ? (
+              <OrderCustomerForm order={order} onDone={() => setEditCustomer(false)} />
+            ) : customer ? (
+              <>
+                <Link
+                  to={'/$storeId/customers/$customerId' as string}
+                  params={{ storeId, customerId: customer.id }}
+                  className="font-medium text-blue-600 no-underline hover:underline"
+                >
+                  {customerDisplayName(customer, t('admin.customers.erased.name'))}
+                </Link>
+                <span className="text-muted-foreground">
+                  {erasedFieldValue(customer.email, customer.anonymized)}
+                </span>
+              </>
+            ) : order.email ? (
+              <span className="text-blue-600">{order.email}</span>
+            ) : (
+              <span className="text-muted-foreground">{t('admin.orders.detail.no_customer')}</span>
+            )}
+          </section>
+
+          <section className="flex flex-col gap-1">
+            {addressHeading(
+              'shipping_address',
+              t('admin.pages.orders.detail.section_shipping_address'),
+            )}
+            <AddressBlock address={shippingAddress} />
+          </section>
+
+          <section className="flex flex-col gap-1">
+            {addressHeading(
+              'billing_address',
+              t('admin.pages.orders.detail.section_billing_address'),
+            )}
+            <AddressBlock
+              address={billingSameAsShipping ? null : order.billing_address}
+              emptyText={
+                billingSameAsShipping
+                  ? t('admin.orders.detail.address_edit.billing_same_as_shipping')
+                  : undefined
+              }
+            />
+            {shippingAddress && !billingSameAsShipping && (
+              <Button
+                variant="outline"
+                size="sm"
+                className="mt-2 self-start"
+                disabled={sameAsShippingMutation.isPending}
+                onClick={() => sameAsShippingMutation.mutate(undefined, { onError: showError })}
+              >
+                <CopyIcon className="size-4" />
+                {t('admin.orders.detail.address_edit.billing_same_as_shipping')}
+              </Button>
+            )}
+          </section>
+        </CardContent>
+      </Card>
+
+      {editAddress && (
+        <AddressFormDialog
+          title={
+            editAddress === 'shipping_address'
+              ? t('admin.orders.detail.address_edit.shipping_title')
+              : t('admin.orders.detail.address_edit.billing_title')
+          }
+          address={editAddress === 'shipping_address' ? shippingAddress : order.billing_address}
+          open={!!editAddress}
+          onOpenChange={(open) => !open && setEditAddress(null)}
+          onSave={(address) =>
+            addressMutation.mutate(
+              { type: editAddress, address },
+              {
+                onSuccess: () => setEditAddress(null),
+                // The dialog stays open on failure so the entered address is
+                // not lost and can be corrected and resubmitted.
+                onError: showError,
+              },
+            )
+          }
+          isPending={addressMutation.isPending}
+        />
+      )}
+    </>
+  )
+}

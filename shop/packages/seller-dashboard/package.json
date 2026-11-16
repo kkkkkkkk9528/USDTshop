@@ -1,0 +1,86 @@
+{
+  "name": "@spree/seller-dashboard",
+  "version": "6.0.4",
+  "license": "MIT",
+  "type": "module",
+  "description": "Spree marketplace seller panel — the seller-facing counterpart to the admin dashboard.",
+  "homepage": "https://spreecommerce.org",
+  "author": "Vendo Connect Inc.",
+  "keywords": [
+    "spree",
+    "commerce",
+    "ecommerce",
+    "marketplace",
+    "seller",
+    "dashboard",
+    "react"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/spree/spree.git",
+    "directory": "packages/seller-dashboard"
+  },
+  "exports": {
+    ".": "./src/index.ts",
+    "./styles.css": "./src/styles.css",
+    "./vite": {
+      "types": "./src/vite/index.ts",
+      "default": "./dist/vite-plugin/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "dist/vite-plugin",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "pnpm generate:routes && tsup",
+    "typecheck": "tsc -b",
+    "lint": "biome check .",
+    "lint:fix": "biome check --fix .",
+    "format": "biome format --write .",
+    "generate:routes": "node scripts/generate-routes.mjs"
+  },
+  "dependencies": {
+    "@hookform/resolvers": "catalog:",
+    "@spree/core": "workspace:^",
+    "@spree/seller-sdk": "workspace:*",
+    "@tanstack/router-plugin": "catalog:",
+    "@tanstack/virtual-file-routes": "catalog:",
+    "zod": "catalog:"
+  },
+  "peerDependencies": {
+    "@spree/admin-sdk": "workspace:^",
+    "@spree/dashboard-core": "workspace:^",
+    "@spree/dashboard-ui": "workspace:^",
+    "@tanstack/react-query": "^5.104.5",
+    "@tanstack/react-router": "^1.170.46",
+    "i18next": "^26.5.3 || ^27.0.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "react-hook-form": "^7.90.0",
+    "react-i18next": "^17.1.0 || ^18.0.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "catalog:",
+    "@spree/admin-sdk": "workspace:*",
+    "@spree/dashboard-core": "workspace:*",
+    "@spree/dashboard-ui": "workspace:*",
+    "@tanstack/react-query": "catalog:",
+    "@tanstack/react-router": "catalog:",
+    "@types/node": "catalog:",
+    "@types/react": "catalog:",
+    "@types/react-dom": "catalog:",
+    "@vitejs/plugin-react": "catalog:",
+    "i18next": "catalog:",
+    "react": "catalog:",
+    "react-dom": "catalog:",
+    "react-hook-form": "catalog:",
+    "react-i18next": "catalog:",
+    "tsup": "catalog:",
+    "typescript": "catalog:",
+    "vite": "catalog:"
+  }
+}

@@ -1,0 +1,56 @@
+{
+  "name": "@spree/dashboard-plugin-example",
+  "private": true,
+  "license": "MIT",
+  "version": "0.0.0",
+  "description": "Example Spree dashboard plugin — adds a Brands feature to the admin via defineDashboardPlugin. Reference implementation for the dashboard plugin authoring docs.",
+  "type": "module",
+  "main": "./src/index.tsx",
+  "module": "./src/index.tsx",
+  "types": "./src/index.tsx",
+  "exports": {
+    ".": "./src/index.tsx"
+  },
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "lint": "biome check src",
+    "lint:fix": "biome check --fix src",
+    "format": "biome format --write src",
+    "typecheck": "tsc --noEmit"
+  },
+  "spree": {
+    "dashboard": {
+      "plugin": true,
+      "routes": "./src/routes"
+    }
+  },
+  "peerDependencies": {
+    "@spree/admin-sdk": "workspace:^",
+    "@spree/dashboard-core": "workspace:^",
+    "@spree/dashboard-ui": "workspace:^",
+    "@tanstack/react-query": "^5.100.9",
+    "@tanstack/react-router": "^1.169.2",
+    "i18next": "^26.2.0 || ^27.0.0",
+    "react": "^19.2.6",
+    "react-dom": "^19.2.6",
+    "react-i18next": "^17.0.8 || ^18.0.0"
+  },
+  "devDependencies": {
+    "@spree/admin-sdk": "workspace:^",
+    "@spree/dashboard-core": "workspace:^",
+    "@spree/dashboard-ui": "workspace:^",
+    "@tanstack/react-query": "catalog:",
+    "@tanstack/react-router": "catalog:",
+    "@types/react": "catalog:",
+    "@types/react-dom": "catalog:",
+    "i18next": "catalog:",
+    "react": "catalog:",
+    "react-dom": "catalog:",
+    "react-i18next": "catalog:",
+    "typescript": "catalog:",
+    "vite": "catalog:"
+  }
+}

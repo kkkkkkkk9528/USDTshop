@@ -1,0 +1,389 @@
+import { CLAIM_STATUSES, EXCHANGE_STATUSES, subsetOf, sumMoney } from '@spree/core'
+import {
+  currencyParts,
+  formatMoney,
+  isPositiveMoney,
+  postSaleItemRow,
+  useMoneyLocale,
+} from '@spree/dashboard-core'
+import {
+  Button,
+  Card,
+  CardAction,
+  CardContent,
+  CardHeader,
+  CardTitle,
+  ClaimResolveDialog,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+  FulfillmentItemList,
+  Section,
+  SectionActions,
+  SectionHeader,
+  SectionTitle,
+  StatusBadge,
+  useConfirm,
+} from '@spree/dashboard-ui'
+import {
+  ArrowLeftRightIcon,
+  BanIcon,
+  EllipsisVerticalIcon,
+  PlusIcon,
+  ShieldAlertIcon,
+} from '@spree/dashboard-ui/icons'
+import type { Claim, Order } from '@spree/seller-sdk'
+import i18n from 'i18next'
+import { useState } from 'react'
+import { useTranslation } from 'react-i18next'
+import {
+  useClaimActions,
+  useExchangeActions,
+  useOrderClaims,
+  useOrderExchanges,
+} from '../../hooks/use-post-sale'
+import { lineLabel } from './line-label'
+import { CreateClaimDialog } from './post-sale-create-dialogs'
+import { useProductLink } from './use-product-link'
+
+const EXCHANGE_ACTIONABLE = subsetOf(EXCHANGE_STATUSES, ['requested', 'approved', 'received'])
+const CLAIM_ACTIONABLE = subsetOf(CLAIM_STATUSES, ['open', 'approved'])
+
+/**
+ * Goods swapped for different ones.
+ *
+ * Read plus the status moves; opening one needs a replacement variant picker,
+ * which the seller's own catalogue search will bring — until then an exchange
+ * is opened by the operator or the customer and worked here.
+ */
+export function ExchangesCard({ order }: { order: Order }) {
+  const productLink = useProductLink()
+  const { t } = useTranslation()
+  const locale = useMoneyLocale()
+  const confirm = useConfirm()
+  const { data } = useOrderExchanges(order.id)
+  const { approve, receive, fulfill, cancel } = useExchangeActions(order.id)
+
+  const exchanges = data?.data ?? []
+  if (exchanges.length === 0) return null
+
+  async function handleCancel(id: string) {
+    const ok = await confirm({
+      title: t('orders.post_sale.exchanges.cancel_title'),
+      message: t('orders.post_sale.exchanges.cancel_message'),
+      variant: 'destructive',
+      confirmLabel: t('orders.post_sale.cancel'),
+    })
+    if (!ok) return
+    cancel.mutate(id)
+  }
+
+  return (
+    <Section>
+      <SectionHeader>
+        <SectionTitle>
+          <ArrowLeftRightIcon className="size-4" />
+          {t('orders.post_sale.exchanges.title')}
+        </SectionTitle>
+      </SectionHeader>
+
+      <div className="flex flex-col gap-4">
+        {exchanges.map((exchange) => (
+          <Card key={exchange.id}>
+            <CardHeader>
+              <CardTitle className="text-base font-medium">{exchange.number}</CardTitle>
+              <CardAction className="flex items-center gap-2">
+                <StatusBadge
+                  status={exchange.status}
+                  label={t(`orders.post_sale.statuses.${exchange.status}`, {
+                    defaultValue: exchange.status,
+                  })}
+                />
+                {EXCHANGE_ACTIONABLE.includes(exchange.status) && (
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <Button variant="ghost" size="icon-xs">
+                        <EllipsisVerticalIcon className="size-4" />
+                        <span className="sr-only">{t('admin.actions.actions_menu')}</span>
+                      </Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end">
+                      {exchange.status === 'requested' && (
+                        <DropdownMenuItem onClick={() => approve.mutate(exchange.id)}>
+                          {t('orders.post_sale.approve')}
+                        </DropdownMenuItem>
+                      )}
+                      {exchange.status === 'approved' && (
+                        <DropdownMenuItem
+                          onClick={() => receive.mutate({ exchangeId: exchange.id })}
+                        >
+                          {t('orders.post_sale.exchanges.receive')}
+                        </DropdownMenuItem>
+                      )}
+                      {exchange.status === 'received' && (
+                        <DropdownMenuItem
+                          onClick={async () => {
+                            // A dearer replacement leaves the customer owing the
+                            // difference, which fulfilling puts on the order.
+                            if (
+                              isPositiveMoney(exchange.price_difference) &&
+                              !(await confirm({
+                                message: t('orders.post_sale.exchanges.balance_due_confirm'),
+                                confirmLabel: t('orders.post_sale.exchanges.fulfill'),
+                              }))
+                            ) {
+                              return
+                            }
+                            fulfill.mutate({ exchangeId: exchange.id })
+                          }}
+                        >
+                          {t('orders.post_sale.exchanges.fulfill')}
+                        </DropdownMenuItem>
+                      )}
+                      <DropdownMenuSeparator />
+                      <DropdownMenuItem
+                        variant="destructive"
+                        onClick={() => handleCancel(exchange.id)}
+                      >
+                        {t('orders.post_sale.cancel')}
+                      </DropdownMenuItem>
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                )}
+              </CardAction>
+            </CardHeader>
+
+            <FulfillmentItemList
+              productLink={productLink}
+              rows={(exchange.exchange_line_items ?? []).map((line) => {
+                const row = postSaleItemRow(
+                  line.id,
+                  {
+                    line_item_id: line.line_item_id,
+                    variant_id: line.original_variant_id,
+                    name: line.name,
+                    variant: line.original_variant,
+                    quantity: line.quantity,
+                  },
+                  order.items ?? [],
+                )
+                return {
+                  ...row,
+                  replacement: {
+                    name:
+                      line.new_variant_name || line.new_variant?.sku || line.new_variant_id || '',
+                    optionsText: line.new_variant?.options_text,
+                    thumbnailUrl: line.new_variant?.thumbnail_url,
+                    productId: line.new_variant?.product_id,
+                    displayPrice: formatMoney(line.new_variant_price, order.currency, locale, {
+                      unitPrice: true,
+                    }),
+                    label: t('admin.pages.orders.detail.claims.resolutions.replacement'),
+                  },
+                }
+              })}
+            />
+            <CardContent className="flex flex-col gap-1.5">
+              <p className="text-muted-foreground text-base">
+                {t('orders.post_sale.exchanges.price_difference', {
+                  amount: formatMoney(exchange.price_difference, order.currency, locale),
+                })}
+              </p>
+            </CardContent>
+          </Card>
+        ))}
+      </div>
+    </Section>
+  )
+}
+
+/** Something went wrong with a delivery, and the seller puts it right. */
+export function ClaimsCard({ order }: { order: Order }) {
+  const productLink = useProductLink()
+  const { t } = useTranslation()
+  const confirm = useConfirm()
+  const { data } = useOrderClaims(order.id)
+  const { approve, deny, cancel } = useClaimActions(order.id)
+
+  const [createOpen, setCreateOpen] = useState(false)
+  const [resolving, setResolving] = useState<Claim | null>(null)
+
+  const claims = data?.data ?? []
+  const canCreate = (order.items ?? []).length > 0
+
+  async function handleCancel(id: string) {
+    const ok = await confirm({
+      title: t('orders.post_sale.claims.cancel_title'),
+      message: t('orders.post_sale.claims.cancel_message'),
+      variant: 'destructive',
+      confirmLabel: t('orders.post_sale.cancel'),
+    })
+    if (!ok) return
+    cancel.mutate(id)
+  }
+
+  async function handleDeny(id: string) {
+    const ok = await confirm({
+      title: t('orders.post_sale.claims.deny_title'),
+      message: t('orders.post_sale.claims.deny_message'),
+      variant: 'destructive',
+      confirmLabel: t('orders.post_sale.claims.deny'),
+    })
+    if (!ok) return
+    deny.mutate(id)
+  }
+
+  return (
+    <Section>
+      <SectionHeader>
+        <SectionTitle>
+          <ShieldAlertIcon className="size-4" />
+          {t('orders.post_sale.claims.title')}
+        </SectionTitle>
+        {canCreate && (
+          <SectionActions>
+            <Button variant="outline" size="sm" onClick={() => setCreateOpen(true)}>
+              <PlusIcon className="size-4" />
+              {t('orders.post_sale.claims.create')}
+            </Button>
+          </SectionActions>
+        )}
+      </SectionHeader>
+
+      <div className="flex flex-col gap-4">
+        {claims.length === 0 ? (
+          <p className="text-muted-foreground text-base">{t('orders.post_sale.claims.empty')}</p>
+        ) : (
+          claims.map((claim) => (
+            <Card key={claim.id}>
+              <CardHeader>
+                <CardTitle className="text-base font-medium">{claim.number}</CardTitle>
+                <CardAction className="flex items-center gap-2">
+                  <StatusBadge
+                    status={claim.status}
+                    label={t(`orders.post_sale.statuses.${claim.status}`, {
+                      defaultValue: claim.status,
+                    })}
+                  />
+                  {CLAIM_ACTIONABLE.includes(claim.status) && (
+                    <DropdownMenu>
+                      <DropdownMenuTrigger asChild>
+                        <Button variant="ghost" size="icon-xs">
+                          <EllipsisVerticalIcon className="size-4" />
+                          <span className="sr-only">{t('admin.actions.actions_menu')}</span>
+                        </Button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end">
+                        {claim.status === 'open' && (
+                          <DropdownMenuItem onClick={() => approve.mutate(claim.id)}>
+                            {t('orders.post_sale.approve')}
+                          </DropdownMenuItem>
+                        )}
+                        {claim.status === 'approved' && (
+                          <DropdownMenuItem onClick={() => setResolving(claim)}>
+                            {t('orders.post_sale.claims.resolve')}
+                          </DropdownMenuItem>
+                        )}
+                        <DropdownMenuItem onClick={() => handleDeny(claim.id)}>
+                          <BanIcon className="size-4" />
+                          {t('orders.post_sale.claims.deny')}
+                        </DropdownMenuItem>
+                        <DropdownMenuSeparator />
+                        <DropdownMenuItem
+                          variant="destructive"
+                          onClick={() => handleCancel(claim.id)}
+                        >
+                          {t('orders.post_sale.cancel')}
+                        </DropdownMenuItem>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
+                  )}
+                </CardAction>
+              </CardHeader>
+
+              <FulfillmentItemList
+                productLink={productLink}
+                rows={(claim.claim_line_items ?? []).map((line) => {
+                  const row = postSaleItemRow(line.id, line, order.items ?? [])
+                  return {
+                    ...row,
+                    optionsText: [row.optionsText, line.description].filter(Boolean).join(' — '),
+                  }
+                })}
+              />
+            </Card>
+          ))
+        )}
+      </div>
+
+      <CreateClaimDialog order={order} open={createOpen} onOpenChange={setCreateOpen} />
+      {resolving && (
+        <ResolveClaimDialog
+          orderId={order.id}
+          order={order}
+          claim={resolving}
+          onOpenChange={() => setResolving(null)}
+        />
+      )}
+    </Section>
+  )
+}
+
+/** Money back, a replacement, or both. */
+
+/**
+ * How the seller puts a delivery right: money back, a replacement, or both.
+ *
+ * The currency is the order's — a seller has none of their own.
+ */
+function ResolveClaimDialog({
+  orderId,
+  order,
+  claim,
+  onOpenChange,
+}: {
+  orderId: string
+  order: Order
+  claim: Claim
+  onOpenChange: (open: boolean) => void
+}) {
+  const { resolve } = useClaimActions(orderId)
+  const lines = claim.claim_line_items ?? []
+  const { symbol: currencySymbol } = currencyParts(order.currency, i18n.language)
+
+  // A claim opened without per-item amounts has a refund_total of zero, and
+  // the workflow refuses to refund nothing — offer what the customer paid for
+  // the claimed items instead, which is also the ceiling it enforces.
+  const paid = sumMoney(lines.map((line) => line.paid_amount))
+  const defaultAmount =
+    isPositiveMoney(claim.refund_total) || !isPositiveMoney(paid) ? claim.refund_total : paid
+
+  return (
+    <ClaimResolveDialog
+      lines={lines.map((line) => ({
+        id: line.id,
+        label: lineLabel(line.name, line.variant, line.variant_id),
+        quantity: line.quantity,
+        sendReplacement: line.send_replacement,
+      }))}
+      defaultAmount={defaultAmount}
+      currencySymbol={currencySymbol}
+      onClose={() => onOpenChange(false)}
+      pending={resolve.isPending}
+      onSubmit={({ resolution, refundMethod, amount, replacementLineItemIds }) => {
+        resolve
+          .mutateAsync({
+            claimId: claim.id,
+            resolution,
+            refundMethod,
+            amount,
+            replacementLineItemIds,
+          })
+          .then(() => onOpenChange(false))
+          .catch(() => undefined)
+      }}
+    />
+  )
+}

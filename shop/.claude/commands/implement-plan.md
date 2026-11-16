@@ -1,0 +1,221 @@
+---
+description: Deliver a docs/plans plan end to end — settle open questions, implement with the changed specs green locally and the full suite on CI, two code reviews plus a simplify pass, a migrated and seeded QA environment ready to start, schema review, and an open, monitored pull request on spree/spree.
+argument-hint: <plan filename or slug>
+---
+
+Implement a plan from `docs/plans/` end to end — from reading it to an open,
+monitored pull request on `spree/spree` with an environment prepared for manual QA.
+
+Plan: $ARGUMENTS (a plan filename or slug; if empty, list the plans in
+`docs/plans/` whose status shows unbuilt work and ask which one)
+
+## How this run works
+
+The goal is to **deliver the plan autonomously and hand the user a finished
+result**: a migrated and seeded worktree the user can start with one command,
+a reviewed and tested branch, an open pull request, and QA instructions — all
+in one run, without the user steering it. Do not leave servers running: the
+user starts them when they sit down to test, and an idle Rails, Vite and Next
+stack per worktree is what exhausts the machine when several runs are active.
+
+- Stage 2 (open questions) is the **only** point where you stop to ask. After
+  the answers are recorded, run every remaining stage without checking in.
+  Routine judgment calls (a column name, a spec's shape, which sample records
+  to seed) are yours to make; note them for the final report instead of asking.
+- Stop early only for a destructive action the plan does not call for, or a
+  blocker only the user can clear (missing credentials, a permission error, a
+  CI failure you cannot reproduce locally). Say what blocked you and what you
+  finished before it.
+- Do every stage in order and do not skip one because it looks unnecessary.
+  Each stage has a clear "done" condition; move on only when it is met.
+- Work happens in a git worktree (`wt switch -c <branch>`), never on `main`.
+  The branch name is the one Linear generates for the plan's issue
+  (`gitBranchName` on the issue, shaped like
+  `feature/v-1234-b2b-order-documents`), so Linear attaches the branch and
+  the pull request to the issue on its own. Without a Linear issue, fall back
+  to a `feature/`, `fix/` or `chore/` branch named after the plan.
+- The plan's trackers move with the run: the Linear issue goes to
+  **In Progress** when implementation starts and to **In Review** when the
+  pull request is open; the pull request carries the Linear id in its title.
+- Keep servers running at the end. The user opens the URLs from the report;
+  shutting the environment down is their call, not yours.
+
+## 1. Read the plan carefully
+
+- Read the plan file in full. Then read every plan it links to or names 
+  and the dated entries in `docs/plans/decisions.md` that touch it.
+- Work out exactly what is still unbuilt: which phases are marked implemented,
+  which are pending, what "6.0 scope" versus "6.1 scope" means for this run.
+  Confirm claims of "shipped" against the code — grep for the classes and
+  migrations the plan says exist.
+- Collect every constraint that applies: the plan's own **Constraints on Current
+  Work**, plus the constraints of *other* plans that mention the same models,
+  tables or endpoints (a plan is bound by its neighbours' rulings too).
+- Write down, in your own words, the list of deliverables before touching code.
+  If the plan has phases, say which ones this run covers. The default is
+  everything the plan targets for the current release.
+- Read the plan's `**Tracking:**` header and note the Linear issue id
+  (`V-NNNN`) and the GitHub issue number: every later stage refers to them.
+  If the line is missing or says `Linear —` / `GitHub —`, open the missing
+  tracker now following "Tracking the plan in Linear and GitHub" in
+  `/project:create-plan` and write it into the header — the branch name in
+  stage 3 comes from the Linear issue. If the Linear MCP tools are not
+  available in this session, carry on without the Linear steps and list
+  them in the final report as work left for the user.
+
+## 2. Settle open questions interactively
+
+If the plan's **Open Questions** section is not empty, or the reading raised a
+decision the plan does not make, resolve them **before** implementation with
+the `AskUserQuestion` tool:
+
+- Ask them together in one call where possible (up to 4 per call), each with
+  2–4 concrete options, your recommendation first and marked `(Recommended)`,
+  and the cost of each option in its description. Use `preview` to show the
+  code, schema or config shape an option implies.
+- Record the answers the way `/project:update-plan` does: move each resolved
+  question into **Key Decisions** with today's date and the reasoning, add
+  accepted trade-offs to **Constraints on Current Work** if they bind other
+  code, add a dated entry to `docs/plans/decisions.md` for anything other plans
+  will need to reference, and update `Last updated`.
+
+Do not pick answers silently and do not defer a question you could ask now. A
+question that genuinely cannot be answered yet stays in Open Questions with the
+reason.
+
+## 3. Implement
+
+- Before the first commit, set the Linear issue's status to **In Progress**
+  (`save_issue` with `state: "In Progress"`) and set the plan's own status
+  line to `In Progress` naming what this run builds, so the plan, the
+  tracker and the branch agree about what is underway. Create the worktree
+  on the issue's `gitBranchName` (read it with `get_issue`).
+- Start with `/goal` so the run has a stated goal to check itself against:
+  the deliverables from stage 1 plus green changed specs and green CI.
+- Follow the plan's phase order and every convention in the `AGENTS.md` files (models,
+  migrations, API controllers, serializers, dashboard, translations in every
+  locale, type generation pipeline when serializers change, OpenAPI regenerated
+  from the integration specs — never edited by hand).
+- Test in two passes, always before moving on:
+  1. **Affected code first, locally.** `pnpm test:changed` runs the specs for
+     the files this branch changed, engine by engine, at low priority
+     (`pnpm test:rspec <engine> <paths>` for a hand-picked set; `pnpm test` /
+     `pnpm exec tsc -b` in a package). Iterate here until green — this is the
+     fast loop. Read the "changed without a matching spec" list it prints: a
+     factory, a migration or a base class touches everything and is what the
+     next pass is for.
+  2. **Then the full suite, on CI.** Push the branch and watch the checks
+     (`gh pr checks --watch` once the PR exists, or `gh run watch`). The laptop
+     runs many sessions at once; a full local suite is only for reproducing a
+     CI failure, and then it goes through `pnpm test:rspec <engine>`, which
+     queues behind the other sessions' suites. Re-run any failing example on
+     its own before investigating — confirm it really fails. For the
+     TypeScript packages: `pnpm turbo lint typecheck test build --force` from
+     the repo root (the `--force` matters — a cached run reads the SDK's stale
+     `dist`). If the dashboard changed, run the affected Playwright specs with
+     `pnpm wt:e2e <spec>`.
+- Commit as you go in logical units. The commit body says what and why, never
+  how; use `git commit --fixup` for follow-ups to a change and squash them
+  before opening the PR. No `Co-Authored-By` or "generated with" trailers.
+
+Done when: every deliverable from stage 1 exists, the changed specs are green
+locally and CI is green on the pushed branch.
+
+## 4. Code review — first round
+
+Run `/code-review` on the branch. Fix every confirmed finding, re-run the
+affected specs, commit. A finding you disagree with gets a one-line reason in
+your notes for the final report, not silence.
+
+## 5. Simplify
+
+Run `/simplify` on the changed code. Apply the cleanups it proposes that keep
+behaviour identical; re-run `pnpm test:changed` after, push, and let CI cover
+the rest of every engine or package the simplification touched.
+
+## 6. Code review — second round
+
+Run `/code-review` again on the result. Fix what it finds. Done when a review
+round comes back clean or with findings you have explicitly decided not to act
+on (and can justify).
+
+## 7. Prepare the application for manual QA
+
+Get this worktree's environment ready so the user can start it and try the
+feature by hand. Prepare it; do not leave it running:
+
+- If the change added migrations: `cd server && bin/rails
+  spree:install:migrations db:migrate`, then `pnpm wt:template` so future
+  worktrees inherit the schema.
+- Seed whatever the feature needs to be visible. Sample products and images:
+  `cd server && bin/rails spree:load_sample_data`. Sellers: `bin/rails
+  spree:sellers:sample_data`. Anything feature-specific (a company, a catalog,
+  a price list, a delivery method) — create it through the Admin API or a
+  `bin/rails runner` script so the QA path starts from real records, and note
+  what you created.
+- Prove the environment boots without leaving a server behind: `cd server &&
+  bin/rails db:abort_if_pending_migrations` and a `bin/rails runner` that reads
+  one of the records you seeded. A worktree you did not check is not ready.
+- Do not start `pnpm wt:dev`, `wt:dashboard`, `wt:storefront` or `wt:seller`
+  for the handover. If you started one earlier to check something in a
+  browser, stop it before moving on; the user starts the servers when they
+  come to test.
+
+## 8. Schema review
+
+Run `/schema-review` for the branch. It publishes the ERD and lifecycle
+artifact for the reviewer; keep the URL for the report. If the change touched
+no migrations the review will say so — run it anyway, "no schema change" is a
+useful thing for a reviewer to have verified.
+
+## 9. Report for manual QA
+
+Print, in one block the user can act on directly:
+
+- **How to start it** — the exact commands for this worktree (`pnpm wt:dev`,
+  `pnpm wt:dashboard`, plus `pnpm wt:storefront` / `pnpm wt:seller` when the
+  plan touches them) and the URLs they will serve (`scripts/worktree/lib.sh`
+  has `rails_url`, `dashboard_url`, `storefront_url`, `seller_url`). Also
+  Mailpit (<http://localhost:8025>) when the feature sends email.
+- **Credentials** — admin `spree@example.com` / `spree123` unless the seed was
+  run with other values; any seller, customer or company account you created
+  for the QA path, with its password.
+- **QA instructions** — a numbered walkthrough per deliverable: where to click,
+  what to enter, what the expected result is, and what would count as a
+  failure. Include the negative cases the plan cares about (a cross-store id
+  must 404, an invalid quantity must be refused with a message, and so on).
+  Skip this only when the change has no user-facing surface, and say so.
+- The schema-review artifact URL.
+
+## 10. Open the pull request and monitor it
+
+- Squash fixups, then run `/open-pr`. It runs the security review, records
+  the reviewed commit, opens the PR and starts monitoring it. The title ends with
+  the Linear id in parentheses, the way the repository already does it:
+  `Add order stages to the dashboard (V-1234)`. The body: what the
+  change does and why, which plan it implements and which phases, the
+  decisions settled in stage 2, how it was tested, and the QA walkthrough from
+  stage 9. Link the plan file. Reference the trackers on their own lines:
+  `Linear: V-1234` and `Closes #NNNN` when this PR completes everything the
+  plan targets for the release, or `Part of #NNNN` when later phases remain,
+  so GitHub does not close the issue early. Keep implementation detail out
+  of it.
+- With the PR open, move the Linear issue to **In Review** and attach the PR
+  URL to it through `save_issue` `links` (Linear usually picks the PR up
+  from the branch name, so check the issue first and add the link only if
+  it is not already there). Comment the PR URL on the GitHub issue so a
+  reader coming from the Roadmap finds the code. When the PR merges, the
+  plan's status becomes `Implemented` through `/project:update-plan`, which
+  moves the trackers to Done and closes the GitHub issue.
+- `/open-pr` ends by running `/autofix-pr`, which watches review comments
+  (humans, Bugbot, CodeRabbit) and CI. Stop and report clearly if something
+  needs the user — a required review, a failing check you cannot reproduce
+  locally, a permission error.
+
+## Final report
+
+End with a summary that stands on its own: the PR URL, the Linear and GitHub
+issue links with the status each is in, what was built (by deliverable), the
+decisions recorded, the review findings acted on and the ones deliberately
+skipped, the QA block from stage 9, and anything left for a follow-up with
+the reason.

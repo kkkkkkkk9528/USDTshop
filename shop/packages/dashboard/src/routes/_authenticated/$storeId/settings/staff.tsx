@@ -1,0 +1,888 @@
+import { zodResolver } from '@hookform/resolvers/zod'
+import {
+  type AdminUser,
+  type AdminUserStatus,
+  type Invitation,
+  type Role,
+  type Session,
+  SpreeError,
+} from '@spree/admin-sdk'
+import {
+  getInitials,
+  mapSpreeErrorsToForm,
+  PageHeader,
+  SettingsSection,
+  Subject,
+  usePermissions,
+} from '@spree/dashboard-core'
+import {
+  Avatar,
+  AvatarFallback,
+  AvatarImage,
+  Badge,
+  Button,
+  CardContent,
+  Checkbox,
+  Dialog,
+  DialogBody,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  Empty,
+  EmptyDescription,
+  EmptyHeader,
+  EmptyMedia,
+  EmptyTitle,
+  Field,
+  FieldError,
+  FieldLabel,
+  Input,
+  Item,
+  ItemContent,
+  ItemDescription,
+  ItemGroup,
+  ItemMedia,
+  ItemTitle,
+  RelativeTime,
+  RowActions,
+  requiredMessage,
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+  Sheet,
+  SheetContent,
+  SheetDescription,
+  SheetFooter,
+  SheetHeader,
+  SheetTitle,
+  Skeleton,
+  StatusBadge,
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+  toastManager,
+  useConfirm,
+} from '@spree/dashboard-ui'
+import {
+  BanIcon,
+  BrowserIcon,
+  ClockIcon,
+  EyeIcon,
+  GlobeIcon,
+  LinkIcon,
+  MailIcon,
+  MonitorIcon,
+  PlusIcon,
+  SmartphoneIcon,
+  TabletIcon,
+  TerminalIcon,
+  UserMinusIcon,
+  UserPlusIcon,
+  UsersIcon,
+  UsersRoundIcon,
+} from '@spree/dashboard-ui/icons'
+import { createFileRoute, Link } from '@tanstack/react-router'
+import i18n from 'i18next'
+import { type ComponentType, type ReactNode, useState } from 'react'
+import { Controller, useForm } from 'react-hook-form'
+import { useTranslation } from 'react-i18next'
+import { z } from 'zod/v4'
+import { useCopyInvitationLink } from '../../../../hooks/use-copy-invitation-link'
+import {
+  useCreateInvitation,
+  useDeleteInvitation,
+  useInvitationAcceptanceLink,
+  useInvitations,
+  useRemoveStaff,
+  useResendInvitation,
+  useRoles,
+  useStaff,
+  useStaffMember,
+  useUpdateStaff,
+} from '../../../../hooks/use-staff'
+import {
+  type DeviceKind,
+  describeUserAgent,
+  type UserAgentDescription,
+} from '../../../../lib/user-agent'
+
+export const Route = createFileRoute('/_authenticated/$storeId/settings/staff')({
+  component: StaffSettingsPage,
+})
+
+// ---------------------------------------------------------------------------
+// Page
+// ---------------------------------------------------------------------------
+
+function StaffSettingsPage() {
+  const { t } = useTranslation()
+  const { data: staff, isLoading: staffLoading } = useStaff()
+  const { data: invitations, isLoading: invitationsLoading } = useInvitations()
+  const [inviteOpen, setInviteOpen] = useState(false)
+
+  const pendingInvitations = invitations?.data.filter((i) => i.status === 'pending') ?? []
+
+  return (
+    <div className="flex flex-col gap-6">
+      <PageHeader
+        docsPath="settings/users"
+        title={t('admin.pages.staff.title')}
+        description={t('admin.pages.staff.subtitle')}
+        actions={
+          <Button onClick={() => setInviteOpen(true)}>
+            <PlusIcon className="size-4" />
+            {t('admin.pages.staff.invite_cta')}
+          </Button>
+        }
+      />
+
+      <StaffCard staff={staff?.data ?? []} loading={staffLoading} />
+
+      {(invitationsLoading || pendingInvitations.length > 0) && (
+        <PendingInvitationsCard invitations={pendingInvitations} loading={invitationsLoading} />
+      )}
+
+      <InviteDialog open={inviteOpen} onOpenChange={setInviteOpen} />
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Active staff card
+// ---------------------------------------------------------------------------
+
+function StaffCard({ staff, loading }: { staff: AdminUser[]; loading: boolean }) {
+  const { t } = useTranslation()
+  return (
+    <SettingsSection title={t('admin.pages.staff.members_section')} icon={<UsersIcon />}>
+      <CardContent className="p-0">
+        {loading ? (
+          <div className="flex flex-col gap-3 p-4">
+            <Skeleton className="h-10 w-full" />
+            <Skeleton className="h-10 w-full" />
+          </div>
+        ) : staff.length === 0 ? (
+          <Empty>
+            <EmptyHeader>
+              <EmptyMedia variant="icon">
+                <UsersRoundIcon />
+              </EmptyMedia>
+              <EmptyTitle>{t('admin.pages.staff.empty')}</EmptyTitle>
+              <EmptyDescription>{t('admin.pages.staff.empty_description')}</EmptyDescription>
+            </EmptyHeader>
+          </Empty>
+        ) : (
+          <Table roundedTop>
+            <TableHeader>
+              <TableRow>
+                <TableHead>{t('admin.pages.staff.table.member')}</TableHead>
+                <TableHead>{t('admin.pages.staff.table.roles')}</TableHead>
+                <TableHead>{t('admin.pages.staff.table.status')}</TableHead>
+                <TableHead>{t('admin.pages.staff.table.last_active')}</TableHead>
+                <TableHead className="w-12" />
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {staff.map((member) => (
+                <StaffRow key={member.id} member={member} />
+              ))}
+            </TableBody>
+          </Table>
+        )}
+      </CardContent>
+    </SettingsSection>
+  )
+}
+
+function StaffRow({ member }: { member: AdminUser }) {
+  const { t } = useTranslation()
+  const [editOpen, setEditOpen] = useState(false)
+  const [detailsOpen, setDetailsOpen] = useState(false)
+  const removeMutation = useRemoveStaff()
+  const confirm = useConfirm()
+
+  const initials = getInitials(member.full_name, member.email)
+
+  async function handleRemove() {
+    const ok = await confirm({
+      title: t('admin.staff.confirm.remove_title'),
+      message: t('admin.staff.confirm.remove_message', {
+        name: member.full_name || member.email,
+      }),
+      variant: 'destructive',
+      confirmLabel: t('admin.actions.remove'),
+    })
+    if (!ok) return
+
+    try {
+      await removeMutation.mutateAsync(member.id)
+      toastManager.add({ type: 'success', title: t('admin.pages.staff.messages.removed') })
+    } catch (err) {
+      toastManager.add({
+        type: 'error',
+        title: err instanceof Error ? err.message : t('admin.staff.errors.failed_to_remove'),
+      })
+    }
+  }
+
+  return (
+    <>
+      <TableRow>
+        <TableCell>
+          <div className="flex items-center gap-3">
+            <Avatar className="size-8">
+              {member.avatar_url && <AvatarImage src={member.avatar_url} alt="" />}
+              <AvatarFallback className="bg-muted text-xs">{initials}</AvatarFallback>
+            </Avatar>
+            <div className="flex flex-col leading-tight">
+              <span className="font-medium text-foreground">
+                {member.full_name || member.email}
+              </span>
+              {member.full_name && (
+                <span className="text-xs text-muted-foreground">{member.email}</span>
+              )}
+            </div>
+          </div>
+        </TableCell>
+        <TableCell>
+          {member.roles.length === 0 ? (
+            <span className="text-base text-muted-foreground">—</span>
+          ) : (
+            <div className="flex flex-wrap gap-1">
+              {member.roles.map((role) => (
+                <Badge key={role.id} className="capitalize" variant="info">
+                  {role.name}
+                </Badge>
+              ))}
+            </div>
+          )}
+        </TableCell>
+        <TableCell>
+          <StaffStatusBadge status={member.status} />
+        </TableCell>
+        <TableCell className="text-base text-muted-foreground">
+          <RelativeTime iso={member.last_active_at} />
+        </TableCell>
+        <TableCell className="text-right">
+          <RowActions
+            actions={[
+              {
+                key: 'view',
+                label: t('admin.actions.view_details'),
+                icon: <EyeIcon className="size-4" />,
+                onSelect: () => setDetailsOpen(true),
+              },
+              { key: 'edit', onSelect: () => setEditOpen(true) },
+              {
+                key: 'remove',
+                label: t('admin.pages.staff.actions.remove'),
+                icon: <UserMinusIcon className="size-4" />,
+                destructive: true,
+                disabled: removeMutation.isPending,
+                onSelect: handleRemove,
+              },
+            ]}
+          />
+        </TableCell>
+      </TableRow>
+
+      <EditStaffSheet open={editOpen} onOpenChange={setEditOpen} member={member} />
+      <StaffDetailsSheet open={detailsOpen} onOpenChange={setDetailsOpen} member={member} />
+    </>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Staff details sheet
+// ---------------------------------------------------------------------------
+
+function StaffDetailsSheet({
+  open,
+  onOpenChange,
+  member,
+}: {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  member: AdminUser
+}) {
+  const { t } = useTranslation()
+  // The list row renders at once; the sheet adds what only it asks for.
+  const { data: details, isLoading, isError } = useStaffMember(member.id, open)
+
+  return (
+    <Sheet open={open} onOpenChange={onOpenChange}>
+      <SheetContent>
+        <SheetHeader>
+          <SheetTitle>{member.full_name || member.email}</SheetTitle>
+          {member.full_name && <SheetDescription>{member.email}</SheetDescription>}
+        </SheetHeader>
+        <div className="flex flex-1 flex-col gap-4 overflow-y-auto p-4">
+          <StaffStatusBadge status={member.status} />
+          <dl className="flex flex-col gap-2 text-base">
+            <DetailRow label={t('admin.pages.staff.details.joined')}>
+              <RelativeTime iso={member.created_at} />
+            </DetailRow>
+            {!isError && (
+              <DetailRow label={t('admin.pages.staff.details.invited_by')}>
+                {isLoading ? <Skeleton className="h-4 w-32" /> : (details?.inviter?.label ?? '—')}
+              </DetailRow>
+            )}
+          </dl>
+          <section className="flex flex-col gap-2">
+            <h3 className="font-medium text-base">{t('admin.pages.staff.sessions.title')}</h3>
+            {isError ? (
+              <p className="text-base text-destructive" role="alert">
+                {t('admin.pages.staff.details.load_failed')}
+              </p>
+            ) : isLoading ? (
+              <Skeleton className="h-12 w-full" />
+            ) : details?.sessions?.length ? (
+              <ItemGroup className="gap-2">
+                {details.sessions.map((session) => (
+                  <SessionRow key={session.id} session={session} />
+                ))}
+              </ItemGroup>
+            ) : (
+              <p className="text-base text-muted-foreground">
+                {t('admin.pages.staff.sessions.empty')}
+              </p>
+            )}
+          </section>
+        </div>
+      </SheetContent>
+    </Sheet>
+  )
+}
+
+const DEVICE_ICONS: Record<DeviceKind, ComponentType<{ className?: string }>> = {
+  desktop: MonitorIcon,
+  mobile: SmartphoneIcon,
+  tablet: TabletIcon,
+  other: TerminalIcon,
+}
+
+function SessionDeviceIcon({ device }: { device: UserAgentDescription | null }) {
+  // Simple Icons, where the logos come from, has no Edge logo.
+  if (device?.browser && device.browser !== 'edge') return <BrowserIcon browser={device.browser} />
+
+  const Icon = device ? DEVICE_ICONS[device.device] : GlobeIcon
+  return <Icon className="size-4" />
+}
+
+function SessionRow({ session }: { session: Session }) {
+  const { t } = useTranslation()
+  const device = session.user_agent ? describeUserAgent(session.user_agent) : null
+
+  return (
+    <Item role="listitem" variant="outline" size="sm">
+      <ItemMedia className="size-9 rounded-md bg-muted text-muted-foreground">
+        <SessionDeviceIcon device={device} />
+      </ItemMedia>
+      <ItemContent className="min-w-0">
+        <ItemTitle className="truncate" title={session.user_agent ?? undefined}>
+          {device?.label ?? t('admin.pages.staff.sessions.unknown_device')}
+        </ItemTitle>
+        <ItemDescription className="flex items-center gap-1.5 text-xs">
+          <span className="font-mono">{session.ip_address ?? '—'}</span>
+          <span aria-hidden>·</span>
+          <RelativeTime iso={session.last_active_at} />
+        </ItemDescription>
+      </ItemContent>
+    </Item>
+  )
+}
+
+function StaffStatusBadge({ status }: { status: AdminUserStatus }) {
+  const { t } = useTranslation()
+  return <StatusBadge status={status} label={t(`admin.pages.staff.status.${status}`)} />
+}
+
+function DetailRow({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <div className="flex items-center justify-between gap-4">
+      <dt className="text-muted-foreground">{label}</dt>
+      <dd>{children}</dd>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Pending invitations card
+// ---------------------------------------------------------------------------
+
+function PendingInvitationsCard({
+  invitations,
+  loading,
+}: {
+  invitations: Invitation[]
+  loading: boolean
+}) {
+  const { t } = useTranslation()
+  return (
+    <SettingsSection title={t('admin.pages.staff.invitations_section')} icon={<UserPlusIcon />}>
+      <CardContent className="p-0">
+        {loading ? (
+          <div className="p-4">
+            <Skeleton className="h-10 w-full" />
+          </div>
+        ) : (
+          <Table roundedTop>
+            <TableHeader>
+              <TableRow>
+                <TableHead>{t('admin.fields.email.label')}</TableHead>
+                <TableHead>{t('admin.pages.staff.table.role')}</TableHead>
+                <TableHead>{t('admin.fields.expires_at.label')}</TableHead>
+                <TableHead className="w-12" />
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {invitations.map((invitation) => (
+                <InvitationRow key={invitation.id} invitation={invitation} />
+              ))}
+            </TableBody>
+          </Table>
+        )}
+      </CardContent>
+    </SettingsSection>
+  )
+}
+
+function InvitationRow({ invitation }: { invitation: Invitation }) {
+  const { t } = useTranslation()
+  const resendMutation = useResendInvitation()
+  const deleteMutation = useDeleteInvitation()
+  const confirm = useConfirm()
+  const acceptanceLink = useInvitationAcceptanceLink()
+  const { permissions } = usePermissions()
+  const copyInvitationLink = useCopyInvitationLink(acceptanceLink.mutateAsync)
+
+  async function handleResend() {
+    try {
+      await resendMutation.mutateAsync(invitation.id)
+      toastManager.add({ type: 'success', title: t('admin.messages.invitation_resent') })
+    } catch (err) {
+      toastManager.add({
+        type: 'error',
+        title: err instanceof Error ? err.message : t('admin.staff.errors.failed_to_resend'),
+      })
+    }
+  }
+
+  async function handleDelete() {
+    const ok = await confirm({
+      title: t('admin.staff.confirm.revoke_title'),
+      message: t('admin.staff.confirm.revoke_message', { email: invitation.email }),
+      variant: 'destructive',
+      confirmLabel: t('admin.actions.revoke'),
+    })
+    if (!ok) return
+
+    try {
+      await deleteMutation.mutateAsync(invitation.id)
+      toastManager.add({ type: 'success', title: t('admin.pages.staff.messages.revoked') })
+    } catch (err) {
+      toastManager.add({
+        type: 'error',
+        title: err instanceof Error ? err.message : t('admin.staff.errors.failed_to_revoke'),
+      })
+    }
+  }
+
+  return (
+    <TableRow>
+      <TableCell>
+        <div className="flex items-center gap-2">
+          <MailIcon className="size-4 text-muted-foreground" />
+          <span className="font-medium">{invitation.email}</span>
+        </div>
+      </TableCell>
+      <TableCell>
+        {invitation.role_name ? (
+          <Badge className="capitalize" variant="info">
+            {invitation.role_name}
+          </Badge>
+        ) : (
+          <span className="text-base text-muted-foreground">—</span>
+        )}
+      </TableCell>
+      <TableCell className="text-base text-muted-foreground">
+        {invitation.expires_at ? (
+          <span className="inline-flex items-center gap-1">
+            <ClockIcon className="size-3.5" />
+            <RelativeTime iso={invitation.expires_at} />
+          </span>
+        ) : (
+          '—'
+        )}
+      </TableCell>
+      <TableCell className="text-right">
+        <RowActions
+          actions={[
+            {
+              key: 'resend',
+              label: t('admin.pages.staff.actions.resend'),
+              icon: <MailIcon className="size-4" />,
+              disabled: resendMutation.isPending,
+              onSelect: handleResend,
+            },
+            {
+              key: 'copy-link',
+              label: t('admin.staff.actions.copy_invitation_link'),
+              icon: <LinkIcon className="size-4" />,
+              visible: permissions.can('update', Subject.Invitation),
+              disabled: acceptanceLink.isPending,
+              onSelect: () => copyInvitationLink(invitation.id),
+            },
+            {
+              key: 'revoke',
+              label: t('admin.actions.revoke'),
+              icon: <BanIcon className="size-4" />,
+              destructive: true,
+              disabled: deleteMutation.isPending,
+              onSelect: handleDelete,
+            },
+          ]}
+        />
+      </TableCell>
+    </TableRow>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Invite dialog
+// ---------------------------------------------------------------------------
+
+const inviteSchema = z.object({
+  email: z
+    .string()
+    .min(1, { error: requiredMessage('email') })
+    .email({ error: () => i18n.t('admin.validation.invalid_email') }),
+  role_id: z.string().min(1, { error: () => i18n.t('admin.staff.validation.role_required') }),
+})
+
+type InviteFormValues = z.infer<typeof inviteSchema>
+
+function InviteDialog({
+  open,
+  onOpenChange,
+}: {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+}) {
+  const { t } = useTranslation()
+  const { data: roles, isLoading: rolesLoading } = useRoles()
+  const createMutation = useCreateInvitation()
+
+  const form = useForm<InviteFormValues>({
+    resolver: zodResolver(inviteSchema),
+    defaultValues: { email: '', role_id: '' },
+  })
+
+  async function onSubmit(values: InviteFormValues) {
+    try {
+      await createMutation.mutateAsync(values)
+      toastManager.add({ type: 'success', title: t('admin.messages.invitation_sent') })
+      form.reset({ email: '', role_id: '' })
+      onOpenChange(false)
+    } catch (err) {
+      if (mapSpreeErrorsToForm(err, form.setError)) return
+      if (err instanceof SpreeError) throw err
+      toastManager.add({
+        type: 'error',
+        title: err instanceof Error ? err.message : t('admin.errors.failed_to_send_invitation'),
+      })
+    }
+  }
+
+  return (
+    <Dialog
+      open={open}
+      onOpenChange={(next) => {
+        if (!next) form.reset({ email: '', role_id: '' })
+        onOpenChange(next)
+      }}
+    >
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>{t('admin.pages.staff.invite_sheet.title')}</DialogTitle>
+          <DialogDescription>{t('admin.pages.staff.invite_sheet.description')}</DialogDescription>
+        </DialogHeader>
+        <form onSubmit={form.handleSubmit(onSubmit)}>
+          <DialogBody className="flex flex-col gap-4">
+            {form.formState.errors.root?.message && (
+              <p className="text-base text-destructive" role="alert">
+                {form.formState.errors.root.message}
+              </p>
+            )}
+            <Field>
+              <FieldLabel htmlFor="invite-email">{t('admin.fields.email.label')}</FieldLabel>
+              <Input
+                id="invite-email"
+                type="email"
+                autoFocus
+                placeholder={t('admin.staff.invite.email_placeholder')}
+                aria-invalid={!!form.formState.errors.email || undefined}
+                {...form.register('email')}
+              />
+              <FieldError errors={[form.formState.errors.email]} />
+            </Field>
+            <Field>
+              <FieldLabel htmlFor="invite-role">{t('admin.fields.role_id.label')}</FieldLabel>
+              <Controller
+                name="role_id"
+                control={form.control}
+                render={({ field }) => {
+                  const roleList = roles?.data ?? []
+                  return (
+                    <Select value={field.value} onValueChange={field.onChange}>
+                      <SelectTrigger id="invite-role">
+                        {/* Base UI's SelectValue defaults to rendering the raw
+                            `value` (a prefixed role ID). Use the children
+                            render-prop to map ID → name. */}
+                        <SelectValue
+                          placeholder={
+                            rolesLoading
+                              ? t('admin.staff.invite.roles_loading')
+                              : t('admin.staff.invite.roles_placeholder')
+                          }
+                        >
+                          {(value) => {
+                            const role = roleList.find((r) => r.id === value)
+                            return role ? (
+                              <span className="capitalize">{role.name}</span>
+                            ) : (
+                              (value as string)
+                            )
+                          }}
+                        </SelectValue>
+                      </SelectTrigger>
+                      <SelectContent>
+                        {roleList.map((role) => (
+                          <SelectItem key={role.id} value={role.id} className="capitalize">
+                            {role.name}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  )
+                }}
+              />
+              <FieldError errors={[form.formState.errors.role_id]} />
+            </Field>
+          </DialogBody>
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => onOpenChange(false)}
+              disabled={form.formState.isSubmitting}
+            >
+              {t('admin.actions.cancel')}
+            </Button>
+            <Button type="submit" disabled={form.formState.isSubmitting}>
+              {form.formState.isSubmitting
+                ? t('admin.actions.sending')
+                : t('admin.actions.send_invitation')}
+            </Button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Edit staff dialog
+// ---------------------------------------------------------------------------
+
+const editSchema = z.object({
+  first_name: z.string().optional(),
+  last_name: z.string().optional(),
+  role_ids: z
+    .array(z.string())
+    .min(1, { error: () => i18n.t('admin.staff.validation.roles_required') }),
+})
+
+type EditFormValues = z.infer<typeof editSchema>
+
+function EditStaffSheet({
+  open,
+  onOpenChange,
+  member,
+}: {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  member: AdminUser
+}) {
+  const { t } = useTranslation()
+  const { storeId } = Route.useParams()
+  const { data: roles } = useRoles()
+  const updateMutation = useUpdateStaff()
+
+  const form = useForm<EditFormValues>({
+    resolver: zodResolver(editSchema),
+    defaultValues: {
+      first_name: member.first_name ?? '',
+      last_name: member.last_name ?? '',
+      role_ids: member.roles.map((r) => r.id),
+    },
+  })
+
+  async function onSubmit(values: EditFormValues) {
+    try {
+      await updateMutation.mutateAsync({
+        id: member.id,
+        params: {
+          first_name: values.first_name || undefined,
+          last_name: values.last_name || undefined,
+          role_ids: values.role_ids,
+        },
+      })
+      toastManager.add({ type: 'success', title: t('admin.pages.staff.messages.updated') })
+      onOpenChange(false)
+    } catch (err) {
+      if (mapSpreeErrorsToForm(err, form.setError)) return
+      if (err instanceof SpreeError) throw err
+      toastManager.add({
+        type: 'error',
+        title: err instanceof Error ? err.message : t('admin.errors.failed_to_update_staff'),
+      })
+    }
+  }
+
+  return (
+    <Sheet
+      open={open}
+      onOpenChange={(next) => {
+        if (!next) {
+          form.reset({
+            first_name: member.first_name ?? '',
+            last_name: member.last_name ?? '',
+            role_ids: member.roles.map((r) => r.id),
+          })
+        }
+        onOpenChange(next)
+      }}
+    >
+      <SheetContent>
+        <SheetHeader>
+          <SheetTitle>{member.full_name || member.email}</SheetTitle>
+          <SheetDescription>{t('admin.staff.edit_description')}</SheetDescription>
+        </SheetHeader>
+        <form onSubmit={form.handleSubmit(onSubmit)} className="flex min-h-0 flex-1 flex-col">
+          <div className="flex flex-1 flex-col gap-4 overflow-y-auto p-4">
+            {form.formState.errors.root?.message && (
+              <p className="text-base text-destructive" role="alert">
+                {form.formState.errors.root.message}
+              </p>
+            )}
+            <div className="grid grid-cols-2 gap-3">
+              <Field>
+                <FieldLabel htmlFor="staff-first-name">
+                  {t('admin.fields.first_name.label')}
+                </FieldLabel>
+                <Input
+                  id="staff-first-name"
+                  aria-invalid={!!form.formState.errors.first_name || undefined}
+                  {...form.register('first_name')}
+                />
+                <FieldError errors={[form.formState.errors.first_name]} />
+              </Field>
+              <Field>
+                <FieldLabel htmlFor="staff-last-name">
+                  {t('admin.fields.last_name.label')}
+                </FieldLabel>
+                <Input
+                  id="staff-last-name"
+                  aria-invalid={!!form.formState.errors.last_name || undefined}
+                  {...form.register('last_name')}
+                />
+                <FieldError errors={[form.formState.errors.last_name]} />
+              </Field>
+            </div>
+            <Field>
+              <FieldLabel>{t('admin.staff.edit.roles_label')}</FieldLabel>
+              <Controller
+                name="role_ids"
+                control={form.control}
+                render={({ field }) => (
+                  <RoleCheckboxGroup
+                    roles={roles?.data ?? []}
+                    value={field.value}
+                    onChange={field.onChange}
+                  />
+                )}
+              />
+              <FieldError errors={[form.formState.errors.role_ids]} />
+              <Link to="/$storeId/settings/roles" params={{ storeId }} className="link text-xs">
+                {t('admin.roles.manage_roles_link')}
+              </Link>
+            </Field>
+          </div>
+          <SheetFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => onOpenChange(false)}
+              disabled={form.formState.isSubmitting}
+            >
+              {t('admin.actions.cancel')}
+            </Button>
+            <Button type="submit" disabled={form.formState.isSubmitting || !form.formState.isDirty}>
+              {form.formState.isSubmitting ? t('admin.actions.saving') : t('admin.actions.save')}
+            </Button>
+          </SheetFooter>
+        </form>
+      </SheetContent>
+    </Sheet>
+  )
+}
+
+// Minimal multi-select for roles. Spree core only ships `admin` today, so a
+// vertical checkbox list is plenty; we'll graduate to a richer picker once
+// roles diversify.
+function RoleCheckboxGroup({
+  roles,
+  value,
+  onChange,
+}: {
+  roles: Role[]
+  value: string[]
+  onChange: (next: string[]) => void
+}) {
+  const { t } = useTranslation()
+
+  function toggle(id: string) {
+    onChange(value.includes(id) ? value.filter((v) => v !== id) : [...value, id])
+  }
+
+  if (roles.length === 0) {
+    return <p className="text-base text-muted-foreground">{t('admin.staff.invite.no_roles')}</p>
+  }
+
+  return (
+    <Item variant="outline" className="flex-col items-stretch gap-1.5">
+      {roles.map((role) => {
+        const checked = value.includes(role.id)
+        const id = `role-${role.id}`
+        return (
+          <label
+            key={role.id}
+            htmlFor={id}
+            className="flex cursor-pointer items-center gap-2 text-base capitalize"
+          >
+            <Checkbox id={id} checked={checked} onCheckedChange={() => toggle(role.id)} />
+            {role.name}
+          </label>
+        )
+      })}
+    </Item>
+  )
+}

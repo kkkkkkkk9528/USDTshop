@@ -1,0 +1,495 @@
+import * as path from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { expect, test } from '@playwright/test'
+import {
+  adminRequest,
+  login,
+  openProfileDialog,
+  saveCustomFieldWithPage,
+  withCustomFieldDefinition,
+} from './helpers'
+
+const FIXTURE_IMAGE = path.join(
+  path.dirname(fileURLToPath(import.meta.url)),
+  'fixtures/test-image.png',
+)
+
+const STORE_PATH = (storeId: string) => `/${storeId}/settings/store`
+const EMAILS_PATH = (storeId: string) => `/${storeId}/settings/emails`
+
+// Both pages mutate a single shared resource (the default store). Run them
+// serially so the email-suite doesn't observe a store name from
+// store-settings mid-update.
+test.describe.configure({ mode: 'serial' })
+
+test.describe('store settings — general', () => {
+  test('loads the store settings page', async ({ page }) => {
+    const creds = await login(page)
+    await page.goto(STORE_PATH(creds.store_id))
+
+    await expect(page.getByRole('heading', { name: /^store settings$/i })).toBeVisible({
+      timeout: 15_000,
+    })
+    await expect(page.locator('#store-name')).toBeVisible()
+  })
+
+  test('renames the store and persists across reload', async ({ page }) => {
+    const creds = await login(page)
+    await page.goto(STORE_PATH(creds.store_id))
+    await expect(page.locator('#store-name')).toBeVisible({ timeout: 15_000 })
+
+    const newName = `E2E Store ${Date.now()}`
+
+    await page.locator('#store-name').fill(newName)
+    await page.getByRole('button', { name: /^save$/i }).click()
+
+    // Toast shows the success message. We don't depend on it being visible by
+    // the time we navigate — the next assertion (reload + value match) is
+    // what confirms persistence.
+    await expect(page.locator('#store-name')).toHaveValue(newName)
+
+    await page.reload()
+    await expect(page.locator('#store-name')).toHaveValue(newName, { timeout: 15_000 })
+
+    // Reset for the rest of the suite — keeps the shared DB clean.
+    await page.locator('#store-name').fill(creds.store_name)
+    await page.getByRole('button', { name: /^save$/i }).click()
+    await expect(page.locator('#store-name')).toHaveValue(creds.store_name)
+  })
+
+  test('setting the store admin language switches the dashboard UI', async ({ page }) => {
+    const creds = await login(page)
+
+    // Normalize the store's admin language to English while the UI is still
+    // English, so the Polish selection below is always a real change regardless
+    // of any value left by a prior run (the suite shares one seeded DB). Save
+    // only when this actually dirties the form.
+    await page.goto(STORE_PATH(creds.store_id))
+    await expect(page.locator('#store-admin-locale')).toBeVisible({ timeout: 15_000 })
+    await page.locator('#store-admin-locale').click()
+    await page.getByRole('option', { name: /^english$/i }).click()
+    const saveEn = page.getByRole('button', { name: /^save$/i })
+    if (await saveEn.isEnabled()) {
+      await saveEn.click()
+      await expect(saveEn).toBeDisabled({ timeout: 15_000 })
+    }
+
+    // Precondition: give the admin an explicit personal language that DIFFERS
+    // from the one we'll set via store settings. This persists `selected_locale`
+    // on the account, which the auth provider treats as the cross-device source
+    // of truth. Without a saved personal language the store-locale switch passes
+    // trivially on a fresh account (selected_locale = null → nothing to revert
+    // it) while still being broken for a real user who has one — the auth
+    // provider reverts a localStorage-only switch back to the saved language on
+    // the next session bootstrap. German here; the store switch to Polish below
+    // must win over it and survive a reload.
+    // A prior run may have already left the account on German, so the dialog
+    // may open in either language — match both, here and on the buttons below.
+    await openProfileDialog(page, /user menu|benutzermenü/i, /edit profile|profil bearbeiten/i)
+    await page.locator('#profile-language').click()
+    await page.getByRole('option', { name: /^deutsch$/i }).click()
+    // Save only if the selection dirtied the form; when it didn't, the account
+    // is already German and the button stays disabled, so just close.
+    const dialog = page.getByRole('dialog')
+    const saveProfile = dialog.getByRole('button', { name: /^(save|speichern)$/i })
+    if (await saveProfile.isEnabled()) await saveProfile.click()
+    else await dialog.getByRole('button', { name: /^(cancel|abbrechen)$/i }).click()
+    // Either way the dialog closes and the admin is on German: saving reloads
+    // into it, and the disabled branch means it was already German.
+    await expect(page.getByRole('link', { name: /^produkte$/i })).toBeVisible({ timeout: 15_000 })
+
+    await page.goto(STORE_PATH(creds.store_id))
+    await expect(page.locator('#store-admin-locale')).toBeVisible({ timeout: 15_000 })
+
+    // Pick Polish (endonym shown in the picker) and save. The page is currently
+    // in German (the precondition above), so the Save button reads "Speichern".
+    // Saving persists admin_locale AND switches the dashboard into
+    // Polish, reloading so every module-load `i18n.t(...)` label re-resolves.
+    await page.locator('#store-admin-locale').click()
+    await page.getByRole('option', { name: /polski/i }).click()
+    await page.getByRole('button', { name: /^speichern$/i }).click()
+
+    // Whole UI re-renders in Polish: the "Standards and formats" card title →
+    // "Standardy i formaty", and the nav "Products" → "Produkty" (proves the
+    // switch drives boot-time labels across nav/tables, not just this form).
+    await expect(page.getByText('Standardy i formaty', { exact: true })).toBeVisible({
+      timeout: 15_000,
+    })
+    await expect(page.getByRole('link', { name: /^produkty$/i })).toBeVisible()
+
+    // The crux: survives a reload. The switch must have been adopted as the
+    // admin's own `selected_locale` (PATCH /me), not just written to
+    // localStorage — otherwise the auth provider reverts to the previously
+    // saved German on the next session bootstrap and the UI bounces back.
+    await page.reload()
+    await expect(page.getByText('Standardy i formaty', { exact: true })).toBeVisible({
+      timeout: 15_000,
+    })
+
+    // Saving an UNRELATED field (the store name) must NOT touch the admin's UI
+    // language: only an actual change to the admin-locale field switches it.
+    // The UI stays Polish — no surprise reload back to a different language.
+    await page.locator('#store-name').fill(`${creds.store_name} ${Date.now()}`)
+    await page.getByRole('button', { name: /^zapisz$/i }).click()
+    await expect(page.getByText('Standardy i formaty', { exact: true })).toBeVisible({
+      timeout: 15_000,
+    })
+
+    // Reset to English + restore the store name so later tests/specs run
+    // against clean English chrome. The page is now in Polish: the admin-locale
+    // field and the save button read "Zapisz".
+    await page.locator('#store-name').fill(creds.store_name)
+    await page.locator('#store-admin-locale').click()
+    await page.getByRole('option', { name: /^english$/i }).click()
+    await page.getByRole('button', { name: /^zapisz$/i }).click()
+    await expect(page.getByText('Standards and formats', { exact: true })).toBeVisible({
+      timeout: 15_000,
+    })
+  })
+
+  // Choosing "Use the default language" removes the store's override rather
+  // than leaving the previous language in place.
+  test('clears the store admin language', async ({ page }) => {
+    const creds = await login(page)
+    await page.goto(STORE_PATH(creds.store_id))
+    const adminLocale = page.locator('#store-admin-locale')
+    const save = page.getByRole('button', { name: /^save$/i })
+    await expect(adminLocale).toBeVisible({ timeout: 15_000 })
+
+    await adminLocale.click()
+    await page.getByRole('option', { name: /^english$/i }).click()
+    if (await save.isEnabled()) {
+      await save.click()
+      await expect(save).toBeDisabled({ timeout: 15_000 })
+    }
+
+    await adminLocale.click()
+    await page.getByRole('option', { name: 'Use the default language', exact: true }).click()
+    await save.click()
+    await expect(save).toBeDisabled({ timeout: 15_000 })
+
+    await page.reload()
+    await expect(adminLocale).toContainText('Use the default language', { timeout: 15_000 })
+  })
+
+  // These settings are written under their plain names (`timezone`,
+  // `guest_checkout`, …) since preferences became a typed contract; each must
+  // still save and come back after a reload.
+  test('saves standards and order numbers, and they survive a reload', async ({ page }) => {
+    const creds = await login(page)
+    await page.goto(STORE_PATH(creds.store_id))
+    const timezone = page.locator('#store-timezone')
+    const prefix = page.locator('#store-order-number-prefix')
+    // The form fills from the store once it loads; wait for that before editing.
+    await expect(prefix).not.toHaveValue('', { timeout: 15_000 })
+
+    const original = {
+      timezone: (await timezone.textContent())?.trim() ?? '',
+      prefix: await prefix.inputValue(),
+    }
+
+    // Browsers list this zone as `Asia/Calcutta`; the store saves and shows
+    // its current IANA name.
+    // A searchable list: typing narrows it to the zone.
+    await timezone.click()
+    await page.getByPlaceholder(/search timezones/i).fill('kolkata')
+    await page.getByRole('option', { name: /^Asia\/Kolkata/ }).click()
+    await prefix.fill('E2E')
+
+    const save = page.getByRole('button', { name: /^save$/i })
+    await save.click()
+    await expect(save).toBeDisabled({ timeout: 15_000 })
+
+    await page.reload()
+    await expect(prefix).toHaveValue('E2E', { timeout: 15_000 })
+    await expect(timezone).toContainText('Asia/Kolkata')
+
+    // Put the shared store back the way it was for the rest of the suite.
+    await timezone.click()
+    await page.getByPlaceholder(/search timezones/i).fill(original.timezone)
+    await page
+      .getByRole('option')
+      .filter({ hasText: new RegExp(`^${original.timezone}(GMT|$)`) })
+      .click()
+    await prefix.fill(original.prefix)
+    await save.click()
+    await expect(save).toBeDisabled({ timeout: 15_000 })
+  })
+
+  // Each sits in a row with its control on the right; a download limit's
+  // number is only offered while its switch is on.
+  test('saves stock and download limits, hiding a limit that is switched off', async ({ page }) => {
+    const creds = await login(page)
+    const original = await adminRequest<{
+      low_stock_threshold: number
+      limit_digital_download_count: boolean
+      digital_asset_authorized_clicks: number
+    }>(page, creds, 'get', '/store')
+
+    try {
+      await page.goto(STORE_PATH(creds.store_id))
+      const threshold = page.getByLabel(/^low stock threshold$/i)
+      const limitCount = page.getByRole('switch', { name: /^limit number of downloads/i })
+      const allowed = page.getByLabel(/^downloads allowed$/i)
+      const save = page.getByRole('button', { name: /^save$/i })
+      await expect(threshold).not.toHaveValue('', { timeout: 15_000 })
+
+      // Start from the limit on, whatever the shared store holds.
+      if ((await limitCount.getAttribute('aria-checked')) !== 'true') await limitCount.click()
+      await expect(allowed).toBeVisible()
+      await threshold.fill('17')
+      await allowed.fill('9')
+      await save.click()
+      await expect(save).toBeDisabled({ timeout: 15_000 })
+
+      await page.reload()
+      await expect(threshold).toHaveValue('17', { timeout: 15_000 })
+      await expect(allowed).toHaveValue('9')
+
+      await limitCount.click()
+      await expect(allowed).toHaveCount(0)
+      await save.click()
+      await expect(save).toBeDisabled({ timeout: 15_000 })
+      await page.reload()
+      await expect(limitCount).toHaveAttribute('aria-checked', 'false', { timeout: 15_000 })
+      await expect(allowed).toHaveCount(0)
+    } finally {
+      await adminRequest(page, creds, 'patch', '/store', {
+        low_stock_threshold: original.low_stock_threshold,
+        limit_digital_download_count: original.limit_digital_download_count,
+        digital_asset_authorized_clicks: original.digital_asset_authorized_clicks,
+      })
+    }
+  })
+
+  // The e2e store supports `de` through its Europe market, so the
+  // translations editor offers it as a target language.
+  test('saves the SEO title and description, and translates them', async ({ page }) => {
+    const creds = await login(page)
+    await page.goto(STORE_PATH(creds.store_id))
+    const seoTitle = page.locator('#store-seo-title')
+    const metaDescription = page.locator('#store-meta-description')
+    await expect(seoTitle).toBeVisible({ timeout: 15_000 })
+
+    const suffix = Date.now()
+    const title = `E2E Coffee ${suffix}`
+    await seoTitle.fill(title)
+    await metaDescription.fill('Freshly roasted coffee')
+    const save = page.getByRole('button', { name: /^save$/i })
+    await save.click()
+    await expect(save).toBeDisabled({ timeout: 15_000 })
+
+    await page.reload()
+    await expect(seoTitle).toHaveValue(title, { timeout: 15_000 })
+    await expect(metaDescription).toHaveValue('Freshly roasted coffee')
+
+    await page.getByRole('button', { name: /manage translations/i }).click()
+    const dialog = page.getByRole('dialog')
+    await expect(dialog.getByTestId('source-seo_title')).toContainText(title, { timeout: 15_000 })
+    await expect(dialog.getByLabel('name de')).toHaveCount(0)
+    const translated = `E2E Kaffee ${suffix}`
+    await dialog.getByLabel('seo_title de').fill(translated)
+    await dialog.getByRole('button', { name: /^save translations$/i }).click()
+    await expect(page.getByText(/translations saved/i)).toBeVisible({ timeout: 15_000 })
+
+    await page.getByRole('button', { name: /^close$/i }).click()
+    await page.getByRole('button', { name: /manage translations/i }).click()
+    await expect(page.getByRole('dialog').getByLabel('seo_title de')).toHaveValue(translated, {
+      timeout: 15_000,
+    })
+    await page.getByRole('button', { name: /^close$/i }).click()
+
+    // Delete the translation so later specs in this shard start without it.
+    const cleared = await page.request.post('/api/v3/admin/translations/batch', {
+      headers: { 'X-Spree-Store-Id': creds.store_id, Authorization: `Bearer ${creds.accessToken}` },
+      data: {
+        translations: [
+          {
+            resource_type: 'store',
+            resource_id: creds.store_id,
+            values: { de: { seo_title: null } },
+          },
+        ],
+      },
+    })
+    if (!cleared.ok()) {
+      throw new Error(`Failed to delete translation: ${cleared.status()} ${await cleared.text()}`)
+    }
+
+    await seoTitle.fill('')
+    await metaDescription.fill('')
+    await save.click()
+    await expect(save).toBeDisabled({ timeout: 15_000 })
+  })
+
+  // A store with no storefront of its own reads back no storefront URL: the
+  // dashboard neither offers to "View store" nor prefills the connect form
+  // with an address the merchant never entered.
+  test('shows no storefront address until one is set', async ({ page }) => {
+    const creds = await login(page)
+    await page.goto(`/${creds.store_id}/getting-started`)
+    await expect(page.getByRole('heading', { name: /^getting started$/i })).toBeVisible({
+      timeout: 15_000,
+    })
+
+    await page.getByRole('button', { name: /^user menu$/i }).click()
+    await expect(page.getByRole('menu')).toBeVisible()
+    await expect(page.getByRole('menuitem', { name: /^view store$/i })).toHaveCount(0)
+    await page.keyboard.press('Escape')
+
+    // Scoped to the page: the sidebar checklist offers the same step.
+    const step = page.getByRole('main').getByRole('button', { name: /set up storefront/i })
+    if ((await step.getAttribute('aria-expanded')) !== 'true') await step.click()
+    await page.getByRole('button', { name: /^connect storefront$/i }).click()
+    await expect(page.getByLabel(/^storefront url$/i)).toHaveValue('')
+  })
+})
+
+test.describe('store settings — emails', () => {
+  test('hides addresses + branding cards when consumer emails are turned off', async ({ page }) => {
+    const creds = await login(page)
+    await page.goto(EMAILS_PATH(creds.store_id))
+    await expect(page.getByRole('heading', { name: /^email settings$/i })).toBeVisible({
+      timeout: 15_000,
+    })
+
+    // The branding card always shows the logo's upload CTA —
+    // use that as a proxy for the card's presence. The CardTitle is rendered as
+    // a `<div>` so `role=heading` doesn't apply, and matching plain text would
+    // collide with other strings.
+    const uploadCta = page.getByText('Upload image')
+
+    // Base UI's <Switch> renders a hidden <input> + a visible <button
+    // role="switch">. The id is on the hidden input, so we drive interaction
+    // via the visible role-switch (matched by its accessible label).
+    const consumerEmailsToggle = page.getByRole('switch', {
+      name: /send transactional emails to customers/i,
+    })
+
+    // Cards visible by default (consumer emails are enabled on a fresh store).
+    await expect(page.locator('#store-mail-from-address')).toBeVisible()
+    await expect(uploadCta).toBeVisible()
+
+    // Toggle off → address + branding cards disappear.
+    await consumerEmailsToggle.click()
+    await expect(page.locator('#store-mail-from-address')).toHaveCount(0)
+    await expect(uploadCta).toHaveCount(0)
+
+    // Toggle back on → cards return without losing the seed value.
+    await consumerEmailsToggle.click()
+    await expect(page.locator('#store-mail-from-address')).toBeVisible()
+    await expect(uploadCta).toBeVisible()
+  })
+
+  test('saves sender + support + notifications addresses and reloads them', async ({ page }) => {
+    const creds = await login(page)
+    await page.goto(EMAILS_PATH(creds.store_id))
+    await expect(page.locator('#store-mail-from-address')).toBeVisible({ timeout: 15_000 })
+
+    const suffix = Date.now()
+    const sender = `sender-${suffix}@example.com`
+    const support = `support-${suffix}@example.com`
+    const ops = `ops-${suffix}@example.com`
+
+    await page.locator('#store-mail-from-address').fill(sender)
+    await page.locator('#store-customer-support-email').fill(support)
+    await page.locator('#store-new-order-notifications-email').fill(ops)
+
+    await page.getByRole('button', { name: /^save$/i }).click()
+
+    // Re-fetch values after the mutation roundtrip. RHF re-seeds defaults on
+    // success, so we don't need an explicit toast wait.
+    await expect(page.locator('#store-mail-from-address')).toHaveValue(sender)
+
+    await page.reload()
+    await expect(page.locator('#store-mail-from-address')).toHaveValue(sender, { timeout: 15_000 })
+    await expect(page.locator('#store-customer-support-email')).toHaveValue(support)
+    await expect(page.locator('#store-new-order-notifications-email')).toHaveValue(ops)
+  })
+
+  // Uploads, saves and then removes the logo, so the shared store ends where
+  // it started.
+  test('uploads the email logo, then removes it', async ({ page }) => {
+    const creds = await login(page)
+    await page.goto(EMAILS_PATH(creds.store_id))
+    await expect(page.locator('#store-mail-from-address')).toBeVisible({ timeout: 15_000 })
+
+    const savedLogo = page.getByText(/^attached file$/i)
+    const save = page.getByRole('button', { name: /^save$/i })
+
+    await page.locator('input[type="file"]').setInputFiles(FIXTURE_IMAGE)
+    await expect(page.getByText(/uploading/i)).toBeHidden({ timeout: 30_000 })
+    await expect(savedLogo).toBeVisible()
+    await save.click()
+    await expect(save).toBeDisabled({ timeout: 15_000 })
+
+    await page.reload()
+    await expect(savedLogo).toBeVisible({ timeout: 15_000 })
+
+    await page.getByRole('button', { name: /^remove$/i }).click()
+    await expect(savedLogo).toHaveCount(0)
+    await save.click()
+    await expect(save).toBeDisabled({ timeout: 15_000 })
+
+    await page.reload()
+    await expect(page.locator('#store-mail-from-address')).toBeVisible({ timeout: 15_000 })
+    await expect(savedLogo).toHaveCount(0)
+  })
+
+  test('flags an invalid mail_from_address inline', async ({ page }) => {
+    const creds = await login(page)
+    await page.goto(EMAILS_PATH(creds.store_id))
+    const senderField = page.locator('#store-mail-from-address')
+    await expect(senderField).toBeVisible({ timeout: 15_000 })
+
+    await senderField.fill('not-an-email')
+
+    // The input is `type="email"`, so the browser's native HTML5 validity
+    // check rejects the value before the form ever submits — that's what the
+    // user actually sees (the native popup blocks the submit). Asserting on
+    // `validity.valid` keeps the test honest about what stops the user from
+    // sending bad data, rather than relying on Zod's downstream `aria-invalid`
+    // (which never fires because the submit is blocked at the form level).
+    await expect(async () => {
+      const valid = await senderField.evaluate((el) => (el as HTMLInputElement).validity.valid)
+      expect(valid).toBe(false)
+    }).toPass({ timeout: 5_000 })
+  })
+
+  test('saves the email colors and font, and they survive a reload', async ({ page }) => {
+    const creds = await login(page)
+    await page.goto(EMAILS_PATH(creds.store_id))
+    const accent = page.locator('#store-email-accent_color')
+    const font = page.locator('#store-email-font')
+    await expect(page.locator('#store-mail-from-address')).not.toHaveValue('', { timeout: 15_000 })
+
+    await accent.fill('#123ABC')
+    await accent.blur()
+    await font.click()
+    await page.getByRole('option', { name: /^georgia$/i }).click()
+
+    const save = page.getByRole('button', { name: /^save$/i })
+    await save.click()
+    await expect(save).toBeDisabled({ timeout: 15_000 })
+
+    await page.reload()
+    await expect(accent).toHaveValue(/^#123abc$/i, { timeout: 15_000 })
+    await expect(font).toContainText(/georgia/i)
+
+    // Back to the shipped design for the rest of the suite.
+    await accent.fill('')
+    await accent.blur()
+    await font.click()
+    await page.getByRole('option', { name: /^inter/i }).click()
+    await save.click()
+    await expect(save).toBeDisabled({ timeout: 15_000 })
+  })
+
+  test('saves a store custom field with the page Save', async ({ page }) => {
+    const creds = await login(page)
+    await withCustomFieldDefinition(page, creds, 'store', async (label) => {
+      await page.goto(STORE_PATH(creds.store_id))
+      await saveCustomFieldWithPage(page, label, 'Region EU')
+    })
+  })
+})

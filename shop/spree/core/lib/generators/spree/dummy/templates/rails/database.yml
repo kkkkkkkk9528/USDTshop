@@ -1,0 +1,79 @@
+<% if options[:lib_name]
+  lib_name = options[:lib_name].gsub('/', '_')
+end %>
+<% db_password = ENV['DB_PASSWORD'] %>
+<% db_username = ENV['DB_USERNAME'] %>
+<% db_host = ENV['DB_HOST'] %>
+<% case ENV['DB']
+  when 'sqlite' %>
+development:
+  adapter: sqlite3
+  database: db/spree_development.sqlite3
+test:
+  adapter: sqlite3
+  database: db/spree_test<%%= ENV['TEST_ENV_NUMBER'] %>.sqlite3
+  timeout: 10000
+production:
+  adapter: sqlite3
+  database: db/spree_production.sqlite3
+<% when 'mysql' %>
+mysql: &mysql
+  adapter: mysql2
+  encoding: utf8
+  <% unless db_username.blank? %>
+  username: <%= db_username %>
+  <% end %>
+  <% unless db_password.blank? %>
+  password: <%= db_password %>
+  <% end %>
+  <% unless db_host.blank? %>
+  host: <%= db_host %>
+  <% end %>
+  reconnect: true
+  pool: 5
+
+development:
+  <<: *mysql
+  database: <%= lib_name %>_spree_development
+test:
+  <<: *mysql
+  database: <%= lib_name %>_spree_test<%%= ENV['TEST_ENV_NUMBER'] %>
+production:
+  <<: *mysql
+  database: <%= lib_name %>_spree_production
+<% when 'postgres' %>
+postgres: &postgres
+  adapter: postgresql
+  <% unless db_username.blank? %>
+  username: <%= db_username || 'postgres' %>
+  <% end %>
+  <% unless db_password.blank? %>
+  password: <%= db_password %>
+  <% end %>
+  <% unless db_host.blank? %>
+  host: <%= db_host %>
+  <% end %>
+  min_messages: warning
+  pool: <%%= ENV.fetch("DB_POOL", 50) %>
+
+development:
+  <<: *postgres
+  database: <%= lib_name %>_spree_development
+test:
+  <<: *postgres
+  database: <%= lib_name %>_spree_test<%%= ENV['TEST_ENV_NUMBER'] %>
+production:
+  <<: *postgres
+  database: <%= lib_name %>_spree_production
+<% else %>
+development:
+  adapter: sqlite3
+  database: db/spree_development.sqlite3
+test:
+  adapter: sqlite3
+  database: db/spree_test<%%= ENV['TEST_ENV_NUMBER'] %>.sqlite3
+  timeout: 10000
+production:
+  adapter: sqlite3
+  database: db/spree_production.sqlite3
+<% end %>

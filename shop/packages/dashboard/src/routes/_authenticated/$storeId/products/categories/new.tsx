@@ -1,0 +1,117 @@
+import { zodResolver } from '@hookform/resolvers/zod'
+import { SpreeError } from '@spree/admin-sdk'
+import {
+  adminClient,
+  extensionFormValues,
+  extensionSubmitValues,
+  mapSpreeErrorsToForm,
+  PageHeader,
+  Slot,
+} from '@spree/dashboard-core'
+import {
+  FormActions,
+  ResourceLayout,
+  toastManager,
+  useFormSubmitShortcut,
+} from '@spree/dashboard-ui'
+import { createFileRoute, useNavigate } from '@tanstack/react-router'
+import { FormProvider, useForm } from 'react-hook-form'
+import { useTranslation } from 'react-i18next'
+import {
+  CategoryMain,
+  CategorySidebar,
+} from '../../../../../components/spree/categories/category-form'
+import { ProductMembershipStagingProvider } from '../../../../../components/spree/product-membership-staging'
+import { useCreateCategory } from '../../../../../hooks/use-categories'
+import {
+  CATEGORY_DEFAULTS,
+  type CategoryFormValues,
+  categoryFormSchema,
+  categoryToParams,
+} from '../../../../../schemas/category'
+
+export const Route = createFileRoute('/_authenticated/$storeId/products/categories/new')({
+  component: NewCategoryPage,
+})
+
+function NewCategoryPage() {
+  const { t } = useTranslation()
+  const { storeId } = Route.useParams()
+  const navigate = useNavigate()
+  const createCategory = useCreateCategory()
+
+  const form = useForm<CategoryFormValues>({
+    resolver: zodResolver(categoryFormSchema),
+    // Extension fields seed their blank value (`from(null)`) on create.
+    defaultValues: { ...CATEGORY_DEFAULTS, ...extensionFormValues('category', null) },
+  })
+
+  const onSubmit = async (values: CategoryFormValues) => {
+    try {
+      const created = await createCategory.mutateAsync({
+        ...categoryToParams(values),
+        // Extension fields come from live form state — the Zod parse behind
+        // `values` strips keys the first-party schema doesn't know.
+        ...extensionSubmitValues('category', form),
+      })
+      // The products picked before the category existed. A failure here leaves
+      // the category created, so it still lands on the edit page to retry.
+      const productIds = values.staged_products.adds.map((product) => product.id)
+      if (productIds.length > 0) {
+        await adminClient.categories.products.create(created.id, productIds).catch(() => {
+          toastManager.add({ type: 'error', title: t('admin.errors.failed_to_update') })
+        })
+      }
+      form.reset(values)
+      // Land on the edit page so images can be managed next.
+      // Replace history rather than pushing — otherwise back lands on the
+      // (now-stale) new category form.
+      await navigate({
+        to: '/$storeId/products/categories/$categoryId',
+        params: { storeId, categoryId: created.id },
+        replace: true,
+      })
+    } catch (err) {
+      if (mapSpreeErrorsToForm(err, form.setError)) return
+      if (err instanceof SpreeError) throw err
+      toastManager.add({ type: 'error', title: t('admin.errors.failed_to_create') })
+    }
+  }
+
+  useFormSubmitShortcut(form, onSubmit)
+
+  return (
+    <FormProvider {...form}>
+      <ProductMembershipStagingProvider form={form} name="staged_products">
+        <form onSubmit={form.handleSubmit(onSubmit)}>
+          {form.formState.errors.root?.message && (
+            <p className="text-base text-destructive" role="alert">
+              {form.formState.errors.root.message}
+            </p>
+          )}
+          <ResourceLayout
+            header={
+              <PageHeader
+                title={t('admin.categories.new_title')}
+                backTo="products/categories"
+                actions={<FormActions form={form} saveLabel={t('admin.actions.save')} />}
+              />
+            }
+            main={
+              <>
+                <CategoryMain form={form} />
+                <Slot name="category.form_main" context={{ category: undefined, mode: 'new' }} />
+              </>
+            }
+            sidebar={
+              <>
+                <CategorySidebar form={form} />
+                <Slot name="category.form_sidebar" context={{ category: undefined, mode: 'new' }} />
+              </>
+            }
+          />
+        </form>
+      </ProductMembershipStagingProvider>
+    </FormProvider>
+  )
+}
