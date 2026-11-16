@@ -1,5 +1,5 @@
 PATH
-  remote: /opt/shop/spree
+  remote: /data/home/shop/shop/spree
   glob: {,*,*/*,*/*/*}.gemspec
   specs:
     spree (6.0.4)

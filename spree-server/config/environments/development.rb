@@ -38,6 +38,10 @@ Rails.application.configure do
   config.hosts << /\A[a-z0-9-]+\.trycloudflare\.com\z/i
   config.hosts << /\A[a-z0-9-]+\.ngrok(-free)?\.(app|io|dev)\z/i
 
+# Allow the sandbox public gateway (instabox) and the custom CDN domain so
+# Storefront/Admin/API requests proxied through Cloudflare are not blocked.
+config.hosts << /\A[a-z0-9-]+\.instabox\.tech\z/i
+
   # Settings specified here will take precedence over those in config/application.rb.
 
   # Make code changes take effect immediately without server restart.

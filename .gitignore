@@ -1,3 +1,7 @@
 
 # Nested git history backups (not source code)
 */.git.bak/
+
+# Local database dump and tool config (not source)
+spree_dev.dump
+lefthook.yml

@@ -38,6 +38,7 @@ function spreeImagePatterns(): RemotePattern[] {
 const nextConfig: NextConfig = {
   output: "standalone",
   allowedDevOrigins: [
+    "3001-agq6fpxsuvfatuuwneiyeyoy34.instabox.tech",
     "shop.lvh.me",
     "*.trycloudflare.com",
     "192.168.33.13",
