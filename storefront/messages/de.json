@@ -56,7 +56,7 @@
     "updatePreferencesFailed": "Die regionalen Einstellungen konnten nicht aktualisiert werden. Bitte versuchen Sie es erneut."
   },
   "footer": {
-    "description": "Open-Source-E-Commerce basierend auf Spree REST API, TypeScript SDK und Next.js. Selbst hosten. Eigene Daten. Keine Plattformgebühren.",
+    "description": "Ihr Ziel für hochwertige Produkte und ein ausgezeichnetes Preis-Leistungs-Verhältnis.",
     "forkOnGithub": "Diese Storefront auf GitHub forken",
     "quickstartGuide": "Schnellstartanleitung",
     "learnMore": "Mehr über Spree Commerce erfahren",
@@ -75,8 +75,8 @@
     "sellers": "Verkäufer"
   },
   "home": {
-    "welcome": "{storeName} Storefront",
-    "heroDescription": "Eine produktionsreife, quelloffene Storefront mit Next.js, React und dem Spree TypeScript SDK. Selbst hosten. Eigener Stack. Kein Vendor Lock-in. Keine Plattformgebühren.",
+    "welcome": "{storeName}",
+    "heroDescription": "Entdecken Sie hochwertige Produkte zu günstigen Preisen. Stöbern Sie durch unsere ausgewählte Kollektion und genießen Sie einen schnellen, zuverlässigen Service.",
     "shopNow": "Alle Produkte",
     "forkOnGithub": "Auf GitHub forken",
     "quickstartGuide": "Schnellstartanleitung",
