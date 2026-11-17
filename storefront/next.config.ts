@@ -51,6 +51,11 @@ const nextConfig: NextConfig = {
   transpilePackages: ["@spree/sdk"],
   reactCompiler: true,
   experimental: {
+    // Cache Components instant-navigation validation reports storefronts that
+    // read live data (getStore/categories/connection) as "blocking routes" and
+    // surfaces them as red error overlays in dev. That is expected for a live
+    // shop. Keep the diagnostics as warnings so they don't interrupt work.
+    instantInsights: { validationLevel: 'manual-warning' },
     // Real 404 responses for missing products, categories and policies render
     // app/global-not-found.tsx (see src/proxy.ts).
     globalNotFound: true,
