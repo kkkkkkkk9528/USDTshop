@@ -31,10 +31,23 @@ interface StoreMetadataParams {
   locale: string;
 }
 
+/**
+ * Cache the Store API lookup used by metadata under Cache Components.
+ * `locale` is a primitive argument, so Next.js includes it in the cache key
+ * automatically — unlike the removed remote cache that served one language
+ * to every locale. Keeping only this fetch cached (instead of the whole
+ * metadata function) leaves next-intl's request-bound getTranslations() in
+ * the uncached fallback path where it is allowed.
+ */
+async function getCachedStore(locale: string): Promise<Store> {
+  "use cache";
+  return getStore(locale);
+}
+
 export async function generateStoreMetadata({
   locale,
 }: StoreMetadataParams): Promise<Metadata> {
-  const store = await getStore(locale);
+  const store = await getCachedStore(locale);
   const seoTitle = storeSeoTitle(store);
   const storeUrl = getStoreUrl();
   const metaDescription = await storeMetaDescription(store, locale);
