@@ -5,8 +5,13 @@ import { getClient } from "@/lib/spree";
 import { FALLBACK_STORE_NAME, getDefaultLocale } from "@/lib/store";
 
 async function cachedGetStore(locale: string): Promise<Store> {
-  // Fetch per-locale at request time. The previous remote data cache ignored
-  // the locale argument and served one language to every locale.
+  "use cache";
+  // Cache the Store API lookup per locale. `locale` is a primitive argument so
+  // Next includes it in the cache key automatically - unlike the removed
+  // `use cache: remote` + cacheTag("store") combination, which collapsed every
+  // language into one shared entry. Caching here keeps getStore() calls in
+  // layouts, headers, footers and metadata prerenderable under Cache Components
+  // instead of surfacing as blocking-prerender-dynamic red overlays in dev.
   return getClient().store.get({ locale });
 }
 
